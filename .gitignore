@@ -1,0 +1,25 @@
+# Secrets
+.env
+credentials.json
+token.json
+service_account.json
+
+# Google Cloud
+.gcloud/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# ADK local state
+.adk/
