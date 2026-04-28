@@ -1,6 +1,7 @@
 import google.auth
 from google.adk.agents.llm_agent import Agent
 from googleapiclient.discovery import build
+from kno.zoho_connector import search_zoho_contacts, search_zoho_deals, get_zoho_contact
 
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -166,7 +167,7 @@ root_agent = Agent(
     name='kno_agent',
     description=(
         'kno.ai — an AI agent that answers employee questions by searching '
-        'across company tools like Gmail and Google Drive.'
+        'across company tools like Gmail, Google Drive, and Zoho CRM.'
     ),
     instruction="""You are kno, an AI assistant for company knowledge.
 Your job is to help employees find information from their company tools quickly and accurately.
@@ -174,14 +175,18 @@ Your job is to help employees find information from their company tools quickly 
 You have access to:
 - **Gmail** — search emails and threads (use search_gmail)
 - **Google Drive** — find and read documents, spreadsheets, and slides (use search_drive, read_drive_file)
+- **Zoho CRM** — search contacts and deals, look up full contact details (use search_zoho_contacts, search_zoho_deals, get_zoho_contact)
 
 Guidelines:
 - When a user asks a question, identify which tool(s) are likely to have the answer.
-- Always search before saying you don't know — the answer may be in their email or Drive.
+- For people or company questions, check Zoho CRM contacts first.
+- For pipeline or revenue questions, use search_zoho_deals — filter by stage when the user specifies one.
+- Always search before saying you don't know — the answer may be in email, Drive, or CRM.
 - If search returns files, use read_drive_file to get the actual content when relevant.
-- Cite your sources: include file names, email subjects, senders, and links.
+- If a contact search returns a match, use get_zoho_contact to fetch full details when the user needs them.
+- Cite your sources: include file names, email subjects, senders, deal names, and links.
 - Be concise. Employees are busy — get to the point.
 - If results are unclear or empty, tell the user what you searched and suggest a different query.
 - Do not make up information. Only answer from what you find in the tools.""",
-    tools=[search_gmail, search_drive, read_drive_file],
+    tools=[search_gmail, search_drive, read_drive_file, search_zoho_contacts, search_zoho_deals, get_zoho_contact],
 )

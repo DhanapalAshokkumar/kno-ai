@@ -23,3 +23,6 @@ build/
 
 # ADK local state
 .adk/
+
+# Zoho OAuth helper (contains credentials)
+get_zoho_token.py
