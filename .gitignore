@@ -26,3 +26,4 @@ build/
 
 # Zoho OAuth helper (contains credentials)
 get_zoho_token.py
+.DS_Store

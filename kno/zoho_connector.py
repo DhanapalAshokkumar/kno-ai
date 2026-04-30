@@ -2,7 +2,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
 
 ZOHO_API_BASE = "https://www.zohoapis.in/crm/v2"
 _token_store = {

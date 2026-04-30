@@ -3,7 +3,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
 
 _SITE = os.getenv("ATLASSIAN_SITE", "")
 _JIRA_BASE = f"https://{_SITE}/rest/api/3"
@@ -25,43 +25,133 @@ def search_jira_issues(query: str) -> dict:
     """Search Jira issues by text using JQL.
 
     Args:
-        query: Text to search for in issue summaries and descriptions, e.g. 'login bug'
+        query: Text to search for in issue summaries and descriptions, e.g. 'login bug'.
+               May include status keywords like 'in progress', 'done', or 'to do'.
 
     Returns:
         Matching issues with key, summary, status, and assignee.
     """
+    # Map of recognisable status keywords → canonical Jira status names (double-quoted in JQL).
+    STATUS_MAP = {
+        "in progress":  "In Progress",
+        "inprogress":   "In Progress",
+        "done":         "Done",
+        "complete":     "Done",
+        "completed":    "Done",
+        "closed":       "Done",
+        "to do":        "To Do",
+        "todo":         "To Do",
+        "open":         "To Do",
+        "backlog":      "To Do",
+    }
+
     def _run_search(jql: str) -> requests.Response:
         print(f"[search_jira_issues] JQL: {jql}")
         return _get(
-            f"{_JIRA_BASE}/search",
-            params={"jql": jql, "maxResults": 10, "fields": "summary,status,assignee"},
+            f"{_JIRA_BASE}/search/jql",
+            params={
+                "jql": jql,
+                "maxResults": 10,
+                "fields": "id,key,summary,status,assignee,priority",
+            },
         )
 
+    def _build_primary_jql(q: str) -> str:
+        """
+        Build the primary JQL query.
+        - If the query already looks like a JQL expression (contains JQL
+          operators such as '=', '~', 'AND', 'OR', 'ORDER BY', 'project',
+          'status', 'assignee', etc.), pass it through unchanged.
+        - If the query contains a recognisable status keyword, include a
+          status clause with the value in double quotes:
+              status = "In Progress" AND text ~ "login" ORDER BY updated DESC
+        - Otherwise wrap it in a plain text search:
+              text ~ "query" ORDER BY updated DESC
+        """
+        import re
+
+        # Heuristic: treat as raw JQL if it contains JQL operators/keywords
+        JQL_PATTERN = re.compile(
+            r'\b(project|status|assignee|reporter|issuetype|priority|'
+            r'created|updated|AND|OR|NOT|ORDER\s+BY|IN\s*\()\b|[=~<>!]',
+            re.IGNORECASE,
+        )
+        if JQL_PATTERN.search(q):
+            return q  # already a JQL expression — use as-is
+
+        q_lower = q.lower().strip()
+        matched_status = None
+        remaining = q
+
+        for keyword, status_name in STATUS_MAP.items():
+            if keyword in q_lower:
+                matched_status = status_name
+                # Remove the matched keyword from the text portion so it isn't
+                # double-counted in the text ~ clause.
+                remaining = re.sub(re.escape(keyword), "", q_lower, flags=re.IGNORECASE).strip()
+                break
+
+        if matched_status and remaining:
+            # status = "In Progress" AND text ~ "login bug" ORDER BY updated DESC
+            return f'status = "{matched_status}" AND text ~ "{remaining}" ORDER BY updated DESC'
+        elif matched_status:
+            # Only a status keyword, no extra text
+            return f'status = "{matched_status}" ORDER BY updated DESC'
+        else:
+            return f'text ~ "{q}" ORDER BY updated DESC'
+
+    def _extract_issue(raw: dict) -> dict:
+        """
+        Parse one issue from the search response.
+        The /search/jql endpoint may return issues with fields populated or
+        just bare {id, key} objects.  When fields are missing or empty, fall
+        back to a GET /issue/{issue_id} call to fetch full details.
+        """
+        fields = raw.get("fields") or {}
+        issue_id = raw.get("id", "")
+        key = raw.get("key", issue_id)
+
+        # Decide whether we need a second call
+        needs_fetch = not fields.get("summary")
+        if needs_fetch:
+            print(f"[search_jira_issues] fields missing for {key}, fetching /issue/{issue_id}")
+            detail_resp = _get(
+                f"{_JIRA_BASE}/issue/{issue_id}",
+                params={"fields": "summary,status,assignee,priority"},
+            )
+            if detail_resp.ok:
+                fields = detail_resp.json().get("fields") or {}
+                key = detail_resp.json().get("key", key)
+            else:
+                print(f"[search_jira_issues] fallback fetch failed for {key}: {detail_resp.status_code}")
+
+        return {
+            "key": key,
+            "summary": fields.get("summary", ""),
+            "status": (fields.get("status") or {}).get("name", ""),
+            "assignee": (fields.get("assignee") or {}).get("displayName", "Unassigned"),
+            "priority": (fields.get("priority") or {}).get("name", ""),
+        }
+
     try:
-        jql = f'text ~ "{query}" ORDER BY updated DESC'
-        resp = _run_search(jql)
+        primary_jql = _build_primary_jql(query)
+        resp = _run_search(primary_jql)
 
         if not resp.ok:
             fallback_jql = f'text ~ "{query}"'
-            print(f"[search_jira_issues] Primary JQL failed ({resp.status_code}), retrying with fallback")
+            print(
+                f"[search_jira_issues] Primary JQL failed (HTTP {resp.status_code}), "
+                f"retrying with fallback"
+            )
             resp = _run_search(fallback_jql)
             if not resp.ok:
                 return {"status": "error", "message": resp.text}
 
-        data = resp.json()
-        issues = data.get("issues", [])
-        if not issues:
+        raw_issues = resp.json().get("issues", [])
+        if not raw_issues:
             return {"status": "no_results", "message": f"No Jira issues found for: {query}"}
 
-        results = [
-            {
-                "key": i["key"],
-                "summary": i["fields"].get("summary", ""),
-                "status": (i["fields"].get("status") or {}).get("name", ""),
-                "assignee": ((i["fields"].get("assignee") or {}).get("displayName", "Unassigned")),
-            }
-            for i in issues
-        ]
+        results = [_extract_issue(i) for i in raw_issues]
         return {"status": "success", "count": len(results), "issues": results}
 
     except Exception as e:
