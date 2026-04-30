@@ -2,6 +2,12 @@ import google.auth
 from google.adk.agents.llm_agent import Agent
 from googleapiclient.discovery import build
 from kno.zoho_connector import search_zoho_contacts, search_zoho_deals, get_zoho_contact
+from kno.atlassian_connector import (
+    search_jira_issues,
+    get_jira_issue,
+    search_confluence_pages,
+    get_confluence_page,
+)
 
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -167,7 +173,7 @@ root_agent = Agent(
     name='kno_agent',
     description=(
         'kno.ai — an AI agent that answers employee questions by searching '
-        'across company tools like Gmail, Google Drive, and Zoho CRM.'
+        'across company tools like Gmail, Google Drive, Zoho CRM, Jira, and Confluence.'
     ),
     instruction="""You are kno, an AI assistant for company knowledge.
 Your job is to help employees find information from their company tools quickly and accurately.
@@ -176,17 +182,34 @@ You have access to:
 - **Gmail** — search emails and threads (use search_gmail)
 - **Google Drive** — find and read documents, spreadsheets, and slides (use search_drive, read_drive_file)
 - **Zoho CRM** — search contacts and deals, look up full contact details (use search_zoho_contacts, search_zoho_deals, get_zoho_contact)
+- **Jira** — search issues by text, get full details of a specific issue (use search_jira_issues, get_jira_issue)
+- **Confluence** — search knowledge base pages, read full page content (use search_confluence_pages, get_confluence_page)
 
 Guidelines:
 - When a user asks a question, identify which tool(s) are likely to have the answer.
 - For people or company questions, check Zoho CRM contacts first.
 - For pipeline or revenue questions, use search_zoho_deals — filter by stage when the user specifies one.
-- Always search before saying you don't know — the answer may be in email, Drive, or CRM.
+- For bug reports, tasks, or project tracking questions, search Jira issues first.
+- For process docs, how-tos, runbooks, or internal knowledge, search Confluence first.
+- Always search before saying you don't know — the answer may be in email, Drive, CRM, Jira, or Confluence.
 - If search returns files, use read_drive_file to get the actual content when relevant.
 - If a contact search returns a match, use get_zoho_contact to fetch full details when the user needs them.
-- Cite your sources: include file names, email subjects, senders, deal names, and links.
+- If a Jira search returns relevant issues, use get_jira_issue for the full description and comments.
+- If a Confluence search returns a relevant page, use get_confluence_page to read its full content.
+- Cite your sources: include file names, email subjects, senders, deal names, issue keys, page titles, and links.
 - Be concise. Employees are busy — get to the point.
 - If results are unclear or empty, tell the user what you searched and suggest a different query.
 - Do not make up information. Only answer from what you find in the tools.""",
-    tools=[search_gmail, search_drive, read_drive_file, search_zoho_contacts, search_zoho_deals, get_zoho_contact],
+    tools=[
+        search_gmail,
+        search_drive,
+        read_drive_file,
+        search_zoho_contacts,
+        search_zoho_deals,
+        get_zoho_contact,
+        search_jira_issues,
+        get_jira_issue,
+        search_confluence_pages,
+        get_confluence_page,
+    ],
 )
