@@ -64,6 +64,15 @@ def _format_ts(ts: str) -> str:
         return ts
 
 
+def _resolve_mentions(cli: WebClient, text: str) -> str:
+    """Replace <@UID> mention tokens in message text with real display names."""
+    import re
+    for uid in re.findall(r"<@(U[A-Z0-9]+)>", text):
+        name = _resolve_sender(cli, uid)
+        text = text.replace(f"<@{uid}>", f"@{name}")
+    return text
+
+
 # ── Read messages ─────────────────────────────────────────────────────────────
 
 def get_slack_channel_messages(channel: str | None = None, limit: int = 20) -> dict:
@@ -88,7 +97,7 @@ def get_slack_channel_messages(channel: str | None = None, limit: int = 20) -> d
         messages = [
             {
                 "sender":    _resolve_sender(cli, m.get("user", "")),
-                "text":      m.get("text", "")[:500],
+                "text":      _resolve_mentions(cli, m.get("text", ""))[:500],
                 "timestamp": _format_ts(m.get("ts", "")),
             }
             for m in history.get("messages", [])
@@ -142,7 +151,7 @@ def search_slack_messages(query: str, channel: str | None = None, limit: int = 5
                         results.append({
                             "channel":   ch["name"],
                             "sender":    _resolve_sender(cli, msg.get("user", "")),
-                            "text":      text[:500],
+                            "text":      _resolve_mentions(cli, text)[:500],
                             "timestamp": _format_ts(msg.get("ts", "")),
                         })
             except SlackApiError:
