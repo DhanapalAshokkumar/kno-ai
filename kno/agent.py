@@ -9,6 +9,13 @@ from kno.atlassian_connector import (
     get_confluence_page,
 )
 from kno.slack_connector import search_slack_messages, get_slack_channel_messages, post_slack_message
+from kno.github_connector import (
+    search_github_issues,
+    get_github_issue,
+    get_github_pull_requests,
+    get_github_pr_reviews,
+    get_github_repo_summary,
+)
 
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -186,6 +193,7 @@ You have access to:
 - **Jira** — search issues by text, get full details of a specific issue (use search_jira_issues, get_jira_issue)
 - **Confluence** — search knowledge base pages, read full page content (use search_confluence_pages, get_confluence_page)
 - **Slack** — browse recent messages in a channel (use get_slack_channel_messages), search by keyword (use search_slack_messages), post messages (use post_slack_message)
+- **GitHub** — search issues (use search_github_issues), get full issue details (use get_github_issue), list PRs (use get_github_pull_requests), get PR reviews (use get_github_pr_reviews), repo summary (use get_github_repo_summary)
 
 Guidelines:
 - When a user asks a question, identify which tool(s) are likely to have the answer.
@@ -194,6 +202,7 @@ Guidelines:
 - For bug reports, tasks, or project tracking questions, search Jira issues first.
 - For process docs, how-tos, runbooks, or internal knowledge, search Confluence first.
 - For team conversations, decisions made in chat, or messages from colleagues, search Slack first.
+- For code reviews, bugs, open PRs, or anything related to software development and repositories, use GitHub tools first.
 - Always search before saying you don't know — the answer may be in email, Drive, CRM, Jira, or Confluence.
 - If search returns files, use read_drive_file to get the actual content when relevant.
 - If a contact search returns a match, use get_zoho_contact to fetch full details when the user needs them.
@@ -217,5 +226,10 @@ Guidelines:
         get_slack_channel_messages,
         search_slack_messages,
         post_slack_message,
+        search_github_issues,
+        get_github_issue,
+        get_github_pull_requests,
+        get_github_pr_reviews,
+        get_github_repo_summary,
     ],
 )
