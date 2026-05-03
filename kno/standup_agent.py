@@ -33,6 +33,7 @@ from kno.atlassian_connector import (
     search_jira_issues,
 )
 from kno.agent import search_gmail  # reuse the tool defined in the main agent
+from kno.slack_connector import post_standup_to_slack
 
 _GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -185,7 +186,7 @@ def send_standup_email(summary_text: str, to_email: str, today: str) -> None:
 
 # ── Runner ────────────────────────────────────────────────────────────────────
 
-async def _run_standup_async(to_email: str | None = None, max_retries: int = 3) -> None:
+async def _run_standup_async(to_email: str | None = None, slack_channel: str | None = None, max_retries: int = 3) -> None:
     """Async core of the standup run, with exponential-backoff retry on 429."""
     today = datetime.date.today().strftime("%A, %B %-d %Y")
     print(f"\n{'─' * 60}")
@@ -227,6 +228,10 @@ async def _run_standup_async(to_email: str | None = None, max_retries: int = 3) 
             if response_text and to_email:
                 send_standup_email(response_text, to_email, today)
 
+            # Post to Slack if requested
+            if response_text and slack_channel:
+                post_standup_to_slack(response_text, today, channel=slack_channel)
+
             return  # success — exit retry loop
 
         except Exception as e:
@@ -245,19 +250,22 @@ async def _run_standup_async(to_email: str | None = None, max_retries: int = 3) 
                 return
 
 
-def run_standup(to_email: str | None = None) -> None:
-    """Run the standup agent once, print to terminal, and optionally email the summary."""
-    asyncio.run(_run_standup_async(to_email=to_email))
+def run_standup(to_email: str | None = None, slack_channel: str | None = None) -> None:
+    """Run the standup agent once, print to terminal, and optionally email/Slack the summary."""
+    asyncio.run(_run_standup_async(to_email=to_email, slack_channel=slack_channel))
 
 
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 
-def schedule_standup(hour: int = 9, minute: int = 0, to_email: str | None = None) -> None:
+def schedule_standup(hour: int = 9, minute: int = 0, to_email: str | None = None, slack_channel: str | None = None) -> None:
     """Schedule run_standup() to fire every day at hour:minute (24-hour clock)."""
     time_str = f"{hour:02d}:{minute:02d}"
-    schedule.every().day.at(time_str).do(run_standup, to_email=to_email)
-    dest = f" → emailing {to_email}" if to_email else " → terminal only"
-    print(f"⏰  Standup scheduled daily at {time_str}{dest}. Waiting…  (Ctrl-C to stop)\n")
+    schedule.every().day.at(time_str).do(run_standup, to_email=to_email, slack_channel=slack_channel)
+    destinations = []
+    if to_email:       destinations.append(f"email → {to_email}")
+    if slack_channel:  destinations.append(f"Slack → {slack_channel}")
+    if not destinations: destinations.append("terminal only")
+    print(f"⏰  Standup scheduled daily at {time_str} ({', '.join(destinations)}). Waiting…  (Ctrl-C to stop)\n")
     try:
         while True:
             schedule.run_pending()
@@ -283,15 +291,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--email",
-        type=str,
-        default=None,
-        metavar="ADDRESS",
+        type=str, default=None, metavar="ADDRESS",
         help="Email address to send the standup to (in addition to terminal output).",
+    )
+    parser.add_argument(
+        "--slack",
+        type=str, default=None, metavar="CHANNEL",
+        help="Slack channel to post the standup to, e.g. #all-knoaiworkspace",
     )
     args = parser.parse_args()
 
     # Always run immediately on startup so you get a standup right away
-    run_standup(to_email=args.email)
+    run_standup(to_email=args.email, slack_channel=args.slack)
 
     if not args.now:
-        schedule_standup(hour=args.hour, minute=args.minute, to_email=args.email)
+        schedule_standup(hour=args.hour, minute=args.minute, to_email=args.email, slack_channel=args.slack)
