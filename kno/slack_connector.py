@@ -23,26 +23,105 @@ def _client() -> WebClient:
     return WebClient(token=_TOKEN)
 
 
+# ── User name cache (avoid repeated API calls) ────────────────────────────────
+_user_cache: dict[str, str] = {}
+
+def _resolve_sender(cli: WebClient, user_id: str) -> str:
+    """Resolve a Slack user ID to a display name, with caching."""
+    if not user_id:
+        return "unknown"
+    if user_id in _user_cache:
+        return _user_cache[user_id]
+    try:
+        info = cli.users_info(user=user_id)
+        name = (
+            info["user"].get("real_name")
+            or info["user"].get("name")
+            or user_id
+        )
+    except SlackApiError:
+        name = user_id
+    _user_cache[user_id] = name
+    return name
+
+
+def _channel_id(cli: WebClient, channel_name: str) -> str | None:
+    """Resolve a channel name to its ID."""
+    name = channel_name.lstrip("#")
+    resp = cli.conversations_list(types="public_channel", limit=200)
+    for ch in resp.get("channels", []):
+        if ch["name"] == name:
+            return ch["id"]
+    return None
+
+
+def _format_ts(ts: str) -> str:
+    """Convert a Slack timestamp to a readable datetime string."""
+    import datetime
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return ts
+
+
 # ── Read messages ─────────────────────────────────────────────────────────────
 
-def search_slack_messages(query: str, channel: str | None = None, limit: int = 10) -> dict:
+def get_slack_channel_messages(channel: str | None = None, limit: int = 20) -> dict:
+    """Get the most recent messages from a Slack channel.
+
+    Args:
+        channel: Channel name, e.g. 'all-knoaiworkspace' or '#general'.
+                 Defaults to SLACK_CHANNEL env var.
+        limit:   Number of recent messages to fetch (default: 20).
+
+    Returns:
+        Recent messages with sender name, text, and timestamp.
+    """
+    try:
+        cli = _client()
+        target = (channel or _CHANNEL).lstrip("#")
+        ch_id = _channel_id(cli, target)
+        if not ch_id:
+            return {"status": "error", "message": f"Channel #{target} not found"}
+
+        history = cli.conversations_history(channel=ch_id, limit=limit)
+        messages = [
+            {
+                "sender":    _resolve_sender(cli, m.get("user", "")),
+                "text":      m.get("text", "")[:500],
+                "timestamp": _format_ts(m.get("ts", "")),
+            }
+            for m in history.get("messages", [])
+            if m.get("text", "").strip()
+        ]
+        if not messages:
+            return {"status": "no_results", "message": f"No messages in #{target}"}
+        return {"status": "success", "channel": target, "count": len(messages), "messages": messages}
+
+    except SlackApiError as e:
+        return {"status": "error", "message": str(e)}
+
+
+def search_slack_messages(query: str, channel: str | None = None, limit: int = 50) -> dict:
     """Search recent Slack messages in a channel by keyword.
 
     Args:
-        query:   Keyword or phrase to search for in messages.
+        query:   Keyword or phrase to search for. Use '*' to return all messages.
         channel: Channel name to search (default: SLACK_CHANNEL env var).
                  Use 'all' to search across all accessible channels.
-        limit:   Max messages to scan per channel (default: 10).
+        limit:   Max messages to scan per channel (default: 50).
 
     Returns:
-        Matching messages with channel, sender, text, and timestamp.
+        Matching messages with channel, sender name, text, and timestamp.
     """
     try:
         cli = _client()
         target = (channel or _CHANNEL).lstrip("#")
 
-        # Resolve all channels or just the specified one
-        all_channels = cli.conversations_list(types="public_channel")["channels"]
+        all_channels = cli.conversations_list(
+            types="public_channel", limit=200
+        ).get("channels", [])
+
         if target == "all":
             channels_to_search = all_channels
         else:
@@ -51,28 +130,23 @@ def search_slack_messages(query: str, channel: str | None = None, limit: int = 1
                 return {"status": "error", "message": f"Channel #{target} not found"}
 
         results = []
+        wildcard = query.strip() == "*"
         for ch in channels_to_search:
             try:
                 history = cli.conversations_history(channel=ch["id"], limit=limit)
                 for msg in history.get("messages", []):
                     text = msg.get("text", "")
-                    if query.lower() in text.lower():
-                        # Resolve user display name
-                        user_id = msg.get("user", "")
-                        try:
-                            user_info = cli.users_info(user=user_id)
-                            sender = user_info["user"]["real_name"]
-                        except Exception:
-                            sender = user_id or "unknown"
-
+                    if not text.strip():
+                        continue
+                    if wildcard or query.lower() in text.lower():
                         results.append({
-                            "channel": ch["name"],
-                            "sender":  sender,
-                            "text":    text[:500],
-                            "ts":      msg.get("ts", ""),
+                            "channel":   ch["name"],
+                            "sender":    _resolve_sender(cli, msg.get("user", "")),
+                            "text":      text[:500],
+                            "timestamp": _format_ts(msg.get("ts", "")),
                         })
             except SlackApiError:
-                continue  # skip channels the bot isn't in
+                continue
 
         if not results:
             return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
