@@ -1,7 +1,7 @@
 """
 Slack connector for kno.ai
 --------------------------
-Posts messages and standup summaries to Slack channels.
+Read messages from and post messages to Slack channels.
 
 Config via env vars or direct args:
     SLACK_BOT_TOKEN   — xoxb-... bot token
@@ -21,6 +21,65 @@ _CHANNEL = os.environ.get("SLACK_CHANNEL", "#all-knoaiworkspace")
 
 def _client() -> WebClient:
     return WebClient(token=_TOKEN)
+
+
+# ── Read messages ─────────────────────────────────────────────────────────────
+
+def search_slack_messages(query: str, channel: str | None = None, limit: int = 10) -> dict:
+    """Search recent Slack messages in a channel by keyword.
+
+    Args:
+        query:   Keyword or phrase to search for in messages.
+        channel: Channel name to search (default: SLACK_CHANNEL env var).
+                 Use 'all' to search across all accessible channels.
+        limit:   Max messages to scan per channel (default: 10).
+
+    Returns:
+        Matching messages with channel, sender, text, and timestamp.
+    """
+    try:
+        cli = _client()
+        target = (channel or _CHANNEL).lstrip("#")
+
+        # Resolve all channels or just the specified one
+        all_channels = cli.conversations_list(types="public_channel")["channels"]
+        if target == "all":
+            channels_to_search = all_channels
+        else:
+            channels_to_search = [c for c in all_channels if c["name"] == target]
+            if not channels_to_search:
+                return {"status": "error", "message": f"Channel #{target} not found"}
+
+        results = []
+        for ch in channels_to_search:
+            try:
+                history = cli.conversations_history(channel=ch["id"], limit=limit)
+                for msg in history.get("messages", []):
+                    text = msg.get("text", "")
+                    if query.lower() in text.lower():
+                        # Resolve user display name
+                        user_id = msg.get("user", "")
+                        try:
+                            user_info = cli.users_info(user=user_id)
+                            sender = user_info["user"]["real_name"]
+                        except Exception:
+                            sender = user_id or "unknown"
+
+                        results.append({
+                            "channel": ch["name"],
+                            "sender":  sender,
+                            "text":    text[:500],
+                            "ts":      msg.get("ts", ""),
+                        })
+            except SlackApiError:
+                continue  # skip channels the bot isn't in
+
+        if not results:
+            return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
+        return {"status": "success", "count": len(results), "messages": results}
+
+    except SlackApiError as e:
+        return {"status": "error", "message": str(e)}
 
 
 # ── Plain post ────────────────────────────────────────────────────────────────

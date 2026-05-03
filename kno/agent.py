@@ -8,6 +8,7 @@ from kno.atlassian_connector import (
     search_confluence_pages,
     get_confluence_page,
 )
+from kno.slack_connector import search_slack_messages, post_slack_message
 
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -184,6 +185,7 @@ You have access to:
 - **Zoho CRM** — search contacts and deals, look up full contact details (use search_zoho_contacts, search_zoho_deals, get_zoho_contact)
 - **Jira** — search issues by text, get full details of a specific issue (use search_jira_issues, get_jira_issue)
 - **Confluence** — search knowledge base pages, read full page content (use search_confluence_pages, get_confluence_page)
+- **Slack** — search messages in channels (use search_slack_messages), post messages (use post_slack_message)
 
 Guidelines:
 - When a user asks a question, identify which tool(s) are likely to have the answer.
@@ -191,6 +193,7 @@ Guidelines:
 - For pipeline or revenue questions, use search_zoho_deals — filter by stage when the user specifies one.
 - For bug reports, tasks, or project tracking questions, search Jira issues first.
 - For process docs, how-tos, runbooks, or internal knowledge, search Confluence first.
+- For team conversations, decisions made in chat, or messages from colleagues, search Slack first.
 - Always search before saying you don't know — the answer may be in email, Drive, CRM, Jira, or Confluence.
 - If search returns files, use read_drive_file to get the actual content when relevant.
 - If a contact search returns a match, use get_zoho_contact to fetch full details when the user needs them.
@@ -211,5 +214,7 @@ Guidelines:
         get_jira_issue,
         search_confluence_pages,
         get_confluence_page,
+        search_slack_messages,
+        post_slack_message,
     ],
 )
