@@ -12,17 +12,19 @@ Usage:
 
 import argparse
 import asyncio
+import base64
 import datetime
 import os
-import smtplib
 import time
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
+import google.auth
 import schedule
 from google.adk.agents.llm_agent import Agent
 from google.adk.runners import InMemoryRunner
 from google.genai import types as genai_types
+from googleapiclient.discovery import build
 
 from kno.atlassian_connector import (
     get_jira_issue,
@@ -32,9 +34,14 @@ from kno.atlassian_connector import (
 )
 from kno.agent import search_gmail  # reuse the tool defined in the main agent
 
-# SMTP sender — reads from env so no extra OAuth scope is needed
-_SMTP_FROM  = os.environ.get("GMAIL_SMTP_FROM", "dhana19.ece@gmail.com")
-_SMTP_PASS  = os.environ.get("GMAIL_APP_PASSWORD", "")   # 16-char Gmail App Password
+_GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+def _gmail_send_service():
+    creds, _ = google.auth.default(scopes=_GMAIL_SCOPES)
+    return build("gmail", "v1", credentials=creds)
 
 
 # ── Agent definition ──────────────────────────────────────────────────────────
@@ -158,28 +165,19 @@ def _text_to_html(text: str, today: str) -> str:
 
 
 def send_standup_email(summary_text: str, to_email: str, today: str) -> None:
-    """Send the standup summary as a styled HTML email via Gmail SMTP.
-
-    Requires env vars:
-        GMAIL_APP_PASSWORD  — 16-char Gmail App Password (myaccount.google.com/apppasswords)
-        GMAIL_SMTP_FROM     — sender address (default: dhana19.ece@gmail.com)
-    """
-    if not _SMTP_PASS:
-        print("⚠️  Email skipped — set GMAIL_APP_PASSWORD env var to enable sending.")
-        return
-
+    """Send the standup summary as a styled HTML email via the Gmail API."""
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🌅 Daily Standup — {today}"
-    msg["From"]    = _SMTP_FROM
+    msg["From"]    = "me"
     msg["To"]      = to_email
 
     msg.attach(MIMEText(summary_text, "plain"))
     msg.attach(MIMEText(_text_to_html(summary_text, today), "html"))
 
+    raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(_SMTP_FROM, _SMTP_PASS)
-            server.sendmail(_SMTP_FROM, to_email, msg.as_string())
+        service = _gmail_send_service()
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
         print(f"📨  Standup emailed to {to_email}")
     except Exception as e:
         print(f"⚠️  Email send failed: {e}")
