@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
-load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env', override=False)  # no-op if file absent (Cloud Run)
 
 _TOKEN   = os.environ.get("SLACK_BOT_TOKEN", "")
 _CHANNEL = os.environ.get("SLACK_CHANNEL", "#all-knoaiworkspace")

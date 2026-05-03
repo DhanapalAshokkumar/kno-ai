@@ -1,4 +1,7 @@
+import os
 import google.auth
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google.adk.agents.llm_agent import Agent
 from googleapiclient.discovery import build
 from kno.zoho_connector import search_zoho_contacts, search_zoho_deals, get_zoho_contact
@@ -19,16 +22,39 @@ from kno.github_connector import (
 
 GMAIL_SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
 DRIVE_SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+GMAIL_DRIVE_SCOPES = GMAIL_SCOPES + DRIVE_SCOPES
+
+
+def _user_credentials() -> Credentials:
+    """Build OAuth2 credentials from env vars (Cloud Run) or ADC (local dev)."""
+    refresh_token = os.environ.get('GMAIL_REFRESH_TOKEN')
+    client_id     = os.environ.get('GMAIL_CLIENT_ID')
+    client_secret = os.environ.get('GMAIL_CLIENT_SECRET')
+
+    if refresh_token and client_id and client_secret:
+        # Cloud Run: use stored OAuth credentials from Secret Manager
+        creds = Credentials(
+            token=None,
+            refresh_token=refresh_token,
+            token_uri='https://oauth2.googleapis.com/token',
+            client_id=client_id,
+            client_secret=client_secret,
+            scopes=GMAIL_DRIVE_SCOPES,
+        )
+        creds.refresh(Request())
+        return creds
+
+    # Local dev: use Application Default Credentials
+    creds, _ = google.auth.default(scopes=GMAIL_DRIVE_SCOPES)
+    return creds
 
 
 def _gmail_service():
-    creds, _ = google.auth.default(scopes=GMAIL_SCOPES)
-    return build('gmail', 'v1', credentials=creds)
+    return build('gmail', 'v1', credentials=_user_credentials())
 
 
 def _drive_service():
-    creds, _ = google.auth.default(scopes=DRIVE_SCOPES)
-    return build('drive', 'v3', credentials=creds)
+    return build('drive', 'v3', credentials=_user_credentials())
 
 
 def _extract_body(payload: dict) -> str:

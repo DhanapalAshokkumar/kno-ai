@@ -1,0 +1,34 @@
+# Secrets — never bake into the image
+.env
+credentials.json
+token.json
+*.json
+!kno/eval_set_Test1.evalset.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Dev / IDE
+.git/
+.gitignore
+.vscode/
+.idea/
+*.DS_Store
+
+# Scripts not needed in the image
+setup_atlassian_data.py
+get_zoho_token.py
+README.md

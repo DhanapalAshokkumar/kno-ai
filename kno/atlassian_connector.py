@@ -3,7 +3,7 @@ import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 
-load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env', override=False)  # no-op if file absent (Cloud Run)
 
 _SITE = os.getenv("ATLASSIAN_SITE", "")
 _JIRA_BASE = f"https://{_SITE}/rest/api/3"

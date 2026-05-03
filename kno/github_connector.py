@@ -12,7 +12,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env', override=False)  # no-op if file absent (Cloud Run)
 
 _TOKEN = os.environ.get("GITHUB_TOKEN", "")
 _OWNER = os.environ.get("GITHUB_OWNER", "DhanapalAshokkumar")

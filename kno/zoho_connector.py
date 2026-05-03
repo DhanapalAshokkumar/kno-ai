@@ -2,7 +2,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-load_dotenv('/Users/dhanapal/kno-ai/kno/.env')
+load_dotenv('/Users/dhanapal/kno-ai/kno/.env', override=False)  # no-op if file absent (Cloud Run)
 
 ZOHO_API_BASE = "https://www.zohoapis.in/crm/v2"
 _token_store = {
@@ -32,8 +32,9 @@ def refresh_zoho_token() -> str:
     Returns:
         The new access token string, or an empty string on failure.
     """
+    # OAuth endpoint is always accounts.zoho.in — separate from the API domain
     response = requests.post(
-        f"{_api_domain()}/oauth/v2/token",
+        "https://accounts.zoho.in/oauth/v2/token",
         data={
             "refresh_token": _refresh_token(),
             "client_id": _client_id(),
