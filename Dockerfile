@@ -15,13 +15,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY kno/ ./kno/
 
-# The container runs the ADK web server on port 8080
+# The container runs the FastAPI production app on port 8080
 # Cloud Run injects PORT env var (default 8080)
 ENV PORT=8080
 
 # Use Vertex AI (no API key needed — uses GCP service account)
 ENV GOOGLE_GENAI_USE_VERTEXAI=1
 
-# Start the ADK web server
-# AGENTS_DIR is /app — the parent dir that contains the kno/ subdirectory
-CMD ["sh", "-c", "adk web --host 0.0.0.0 --port ${PORT} /app"]
+# Start the FastAPI production app
+CMD ["sh", "-c", "uvicorn kno.prod_app:app --host 0.0.0.0 --port ${PORT}"]

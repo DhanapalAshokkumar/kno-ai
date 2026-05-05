@@ -1,0 +1,558 @@
+"""
+Multi-tenant agent runner.
+Each user's query executes with ONLY their own credentials — never another user's.
+"""
+import os
+import base64
+from typing import Optional, AsyncGenerator
+
+from google.adk.agents.llm_agent import Agent
+from google.adk.runners import InMemoryRunner
+from google.genai import types as genai_types
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+from kno.user_store import get_app_credentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+_INSTRUCTION = """You are kno, an AI assistant for company knowledge.
+Help employees find information from their connected tools quickly and accurately.
+
+If a tool returns "not connected", tell the user to go to Settings → Connect Apps.
+Always search before saying you don't know. Be concise. Cite your sources with links."""
+
+
+# ── Per-user Google services ──────────────────────────────────────────────────
+
+def _google_creds(creds_data: dict) -> Credentials:
+    c = Credentials(
+        token=None,
+        refresh_token=creds_data["refresh_token"],
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=creds_data["client_id"],
+        client_secret=creds_data["client_secret"],
+        scopes=SCOPES,
+    )
+    c.refresh(Request())
+    return c
+
+
+# ── Tool factories (scoped to one user) ──────────────────────────────────────
+
+def _make_gmail_tool(email: str):
+    creds_data = get_app_credentials(email, "gmail")
+
+    def search_gmail(query: str, max_results: int = 5) -> dict:
+        """Search Gmail for emails and threads matching a query.
+
+        Args:
+            query: Gmail search query, e.g. 'from:boss@company.com budget'
+            max_results: Max threads to return (default 5)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Gmail not connected — go to Settings to connect your Gmail."}
+        try:
+            svc = build("gmail", "v1", credentials=_google_creds(creds_data))
+            resp = svc.users().threads().list(userId="me", q=query, maxResults=max_results).execute()
+            threads = resp.get("threads", [])
+            if not threads:
+                return {"status": "no_results", "message": f"No emails found for: {query}"}
+            results = []
+            for t in threads:
+                detail = svc.users().threads().get(userId="me", id=t["id"], format="full").execute()
+                msgs = detail.get("messages", [])
+                headers, body_parts = {}, []
+                for msg in msgs:
+                    payload = msg.get("payload", {})
+                    if not headers:
+                        headers = {h["name"]: h["value"] for h in payload.get("headers", [])}
+
+                    def _extract(p):
+                        if p.get("mimeType") == "text/plain":
+                            d = p.get("body", {}).get("data", "")
+                            return base64.urlsafe_b64decode(d + "==").decode("utf-8", errors="replace") if d else ""
+                        for part in p.get("parts", []):
+                            t = _extract(part)
+                            if t: return t
+                        return ""
+
+                    text = _extract(payload)
+                    if text.strip():
+                        body_parts.append(text.strip())
+                results.append({
+                    "thread_id": t["id"],
+                    "subject": headers.get("Subject", "(no subject)"),
+                    "from": headers.get("From", "unknown"),
+                    "date": headers.get("Date", "unknown"),
+                    "body": "\n---\n".join(body_parts)[:3000],
+                })
+            return {"status": "success", "count": len(results), "threads": results}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return search_gmail
+
+
+def _make_drive_tool(email: str):
+    creds_data = get_app_credentials(email, "gmail")  # Gmail and Drive share OAuth
+
+    def search_drive(query: str, max_results: int = 5) -> dict:
+        """Search Google Drive for files matching a query.
+
+        Args:
+            query: Keyword search, e.g. 'Q3 roadmap deck'
+            max_results: Max files to return (default 5)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Google Drive not connected — go to Settings to connect your Google account."}
+        try:
+            svc = build("drive", "v3", credentials=_google_creds(creds_data))
+            resp = svc.files().list(
+                q=f"fullText contains '{query}' and trashed=false",
+                pageSize=max_results,
+                fields="files(id,name,mimeType,modifiedTime,webViewLink,owners)",
+            ).execute()
+            files = resp.get("files", [])
+            if not files:
+                return {"status": "no_results", "message": f"No files found for: {query}"}
+            return {"status": "success", "count": len(files), "files": [
+                {"id": f["id"], "name": f.get("name"),
+                 "modified": f.get("modifiedTime"), "url": f.get("webViewLink")}
+                for f in files
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return search_drive
+
+
+def _make_slack_tools(email: str):
+    from slack_sdk import WebClient
+    from slack_sdk.errors import SlackApiError
+
+    creds_data = get_app_credentials(email, "slack")
+
+    def _client():
+        token = creds_data["bot_token"] if creds_data else ""
+        return WebClient(token=token)
+
+    def search_slack_messages(query: str, limit: int = 30) -> dict:
+        """Search recent Slack messages by keyword.
+
+        Args:
+            query: Keyword to search for
+            limit: Max messages to scan (default 30)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
+        try:
+            cli = _client()
+            channels = cli.conversations_list(types="public_channel", limit=100).get("channels", [])
+            results = []
+            for ch in channels:
+                try:
+                    history = cli.conversations_history(channel=ch["id"], limit=limit)
+                    for msg in history.get("messages", []):
+                        text = msg.get("text", "")
+                        if query.lower() in text.lower():
+                            results.append({
+                                "channel": ch["name"],
+                                "text": text[:400],
+                                "timestamp": msg.get("ts", ""),
+                            })
+                except SlackApiError:
+                    continue
+            return {"status": "success", "count": len(results), "messages": results} if results \
+                else {"status": "no_results", "message": f"No Slack messages found for: {query}"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_slack_messages]
+
+
+def _make_github_tools(email: str):
+    import requests as req
+
+    creds_data = get_app_credentials(email, "github")
+
+    def _headers():
+        token = creds_data.get("token", "") if creds_data else ""
+        return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+
+    def search_github_issues(query: str, repo: str = None, state: str = "open") -> dict:
+        """Search GitHub issues by keyword.
+
+        Args:
+            query: Text to search in issue titles/bodies
+            repo: 'owner/repo' or bare repo name
+            state: 'open', 'closed', or 'all'
+        """
+        if not creds_data:
+            return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
+        try:
+            owner = creds_data.get("owner", "")
+            q = f"{query} repo:{owner}/{repo or owner} is:issue state:{state}"
+            r = req.get("https://api.github.com/search/issues",
+                        headers=_headers(), params={"q": q, "per_page": 10})
+            items = r.json().get("items", [])
+            if not items:
+                return {"status": "no_results", "message": f"No issues found for: {query}"}
+            return {"status": "success", "count": len(items), "issues": [
+                {"number": i["number"], "title": i["title"],
+                 "state": i["state"], "url": i["html_url"]}
+                for i in items
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_github_pull_requests(repo: str = None, state: str = "open") -> dict:
+        """List pull requests for a GitHub repo.
+
+        Args:
+            repo: 'owner/repo' or bare repo name
+            state: 'open', 'closed', or 'all'
+        """
+        if not creds_data:
+            return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
+        try:
+            owner = creds_data.get("owner", "")
+            full_repo = f"{owner}/{repo or owner}"
+            r = req.get(f"https://api.github.com/repos/{full_repo}/pulls",
+                        headers=_headers(), params={"state": state, "per_page": 20})
+            prs = r.json()
+            if not prs:
+                return {"status": "no_results", "message": f"No {state} PRs in {full_repo}"}
+            return {"status": "success", "count": len(prs), "pull_requests": [
+                {"number": p["number"], "title": p["title"],
+                 "author": p["user"]["login"], "url": p["html_url"]}
+                for p in prs
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_github_issues, get_github_pull_requests]
+
+
+def _make_jira_tools(email: str):
+    """Jira/Confluence tools scoped to the user's own Atlassian credentials."""
+    import requests as req
+
+    creds_data = get_app_credentials(email, "jira")
+
+    def _auth():
+        if not creds_data:
+            return None
+        return (creds_data["email"], creds_data["api_token"])
+
+    def _base(path: str) -> str:
+        site = creds_data["site"] if creds_data else ""
+        return f"https://{site}{path}"
+
+    def search_jira_issues(query: str, project: str = None, status: str = None, max_results: int = 10) -> dict:
+        """Search Jira issues by text, project, and status.
+
+        Args:
+            query: Text to search in issue summaries and descriptions
+            project: Jira project key, e.g. 'ENG' or 'KNO'
+            status: Issue status filter, e.g. 'In Progress', 'Done', 'To Do'
+            max_results: Max issues to return (default 10)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Jira not connected — go to Settings to connect Jira."}
+        try:
+            proj = project or creds_data.get("jira_project", "")
+            jql_parts = [f'text ~ "{query}"']
+            if proj:
+                jql_parts.append(f'project = "{proj}"')
+            if status:
+                jql_parts.append(f'status = "{status}"')
+            jql = " AND ".join(jql_parts) + " ORDER BY updated DESC"
+
+            r = req.get(
+                _base("/rest/api/3/search"),
+                auth=_auth(),
+                params={"jql": jql, "maxResults": max_results,
+                        "fields": "summary,status,assignee,priority,created,updated,description"},
+            )
+            if not r.ok:
+                return {"status": "error", "message": r.text}
+            issues = r.json().get("issues", [])
+            if not issues:
+                return {"status": "no_results", "message": f"No Jira issues found for: {query}"}
+            return {"status": "success", "count": len(issues), "issues": [
+                {
+                    "key": i["key"],
+                    "summary": i["fields"]["summary"],
+                    "status": i["fields"]["status"]["name"],
+                    "assignee": (i["fields"].get("assignee") or {}).get("displayName", "unassigned"),
+                    "url": f"https://{creds_data['site']}/browse/{i['key']}",
+                }
+                for i in issues
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_jira_issue(issue_key: str) -> dict:
+        """Get full details of a Jira issue including description and comments.
+
+        Args:
+            issue_key: Jira issue key, e.g. 'ENG-123'
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Jira not connected — go to Settings to connect Jira."}
+        try:
+            r = req.get(_base(f"/rest/api/3/issue/{issue_key}"), auth=_auth())
+            if not r.ok:
+                return {"status": "error", "message": r.text}
+            data = r.json()
+            fields = data.get("fields", {})
+
+            # Get comments
+            comments_r = req.get(_base(f"/rest/api/3/issue/{issue_key}/comment"), auth=_auth())
+            comments = []
+            if comments_r.ok:
+                for c in comments_r.json().get("comments", [])[:5]:
+                    body = c.get("body", {})
+                    text = ""
+                    if isinstance(body, dict):
+                        for block in body.get("content", []):
+                            for inner in block.get("content", []):
+                                text += inner.get("text", "")
+                    comments.append({
+                        "author": (c.get("author") or {}).get("displayName", "unknown"),
+                        "text": text[:300],
+                    })
+
+            return {
+                "status": "success",
+                "key": issue_key,
+                "summary": fields.get("summary"),
+                "status": fields.get("status", {}).get("name"),
+                "assignee": (fields.get("assignee") or {}).get("displayName", "unassigned"),
+                "url": f"https://{creds_data['site']}/browse/{issue_key}",
+                "comments": comments,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def search_confluence_pages(query: str, space: str = None, max_results: int = 5) -> dict:
+        """Search Confluence knowledge base pages.
+
+        Args:
+            query: Text to search for
+            space: Confluence space key to restrict search (optional)
+            max_results: Max pages to return (default 5)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Confluence not connected — go to Settings to connect Jira/Confluence."}
+        try:
+            sp = space or creds_data.get("confluence_space", "")
+            params = {"cql": f'type=page AND text ~ "{query}"' + (f' AND space = "{sp}"' if sp else ""),
+                      "limit": max_results, "expand": "version"}
+            r = req.get(_base("/wiki/rest/api/content/search"), auth=_auth(), params=params)
+            if not r.ok:
+                return {"status": "error", "message": r.text}
+            results = r.json().get("results", [])
+            if not results:
+                return {"status": "no_results", "message": f"No Confluence pages found for: {query}"}
+            return {"status": "success", "count": len(results), "pages": [
+                {"id": p["id"], "title": p["title"],
+                 "url": f"https://{creds_data['site']}/wiki{p['_links'].get('webui', '')}"}
+                for p in results
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_confluence_page(page_id: str) -> dict:
+        """Get the full content of a Confluence page.
+
+        Args:
+            page_id: Confluence page ID (from search_confluence_pages results)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Confluence not connected — go to Settings to connect Jira/Confluence."}
+        try:
+            r = req.get(_base(f"/wiki/rest/api/content/{page_id}"),
+                        auth=_auth(), params={"expand": "body.storage,version"})
+            if not r.ok:
+                return {"status": "error", "message": r.text}
+            data = r.json()
+            raw_html = data.get("body", {}).get("storage", {}).get("value", "")
+            # Strip HTML tags for readable text
+            import re
+            text = re.sub(r"<[^>]+>", " ", raw_html)
+            text = re.sub(r"\s+", " ", text).strip()[:5000]
+            return {
+                "status": "success",
+                "title": data.get("title"),
+                "url": f"https://{creds_data['site']}/wiki{data.get('_links', {}).get('webui', '')}",
+                "content": text,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_jira_issues, get_jira_issue, search_confluence_pages, get_confluence_page]
+
+
+def _make_zoho_tools(email: str):
+    """Zoho CRM tools scoped to the user's own credentials."""
+    import requests as req
+
+    creds_data = get_app_credentials(email, "zoho")
+    _token_store = {"access_token": ""}
+
+    def _refresh():
+        if not creds_data:
+            return ""
+        r = req.post(
+            "https://accounts.zoho.in/oauth/v2/token",
+            data={
+                "refresh_token": creds_data["refresh_token"],
+                "client_id": creds_data["client_id"],
+                "client_secret": creds_data["client_secret"],
+                "grant_type": "refresh_token",
+            },
+        )
+        token = r.json().get("access_token", "")
+        _token_store["access_token"] = token
+        return token
+
+    def _headers():
+        if not _token_store["access_token"]:
+            _refresh()
+        return {"Authorization": f"Zoho-oauthtoken {_token_store['access_token']}"}
+
+    def _get(url, params=None):
+        resp = req.get(url, headers=_headers(), params=params)
+        if resp.status_code == 401:
+            _refresh()
+            resp = req.get(url, headers=_headers(), params=params)
+        return resp
+
+    BASE = "https://www.zohoapis.in/crm/v2"
+
+    def search_zoho_contacts(query: str) -> dict:
+        """Search Zoho CRM contacts by name or email.
+
+        Args:
+            query: Name or email to search for, e.g. 'Alice' or 'alice@acme.com'
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Zoho CRM not connected — go to Settings to connect Zoho."}
+        try:
+            resp = _get(f"{BASE}/Contacts/search",
+                        params={"word": query, "fields": "First_Name,Last_Name,Email,Phone"})
+            if resp.status_code == 204:
+                return {"status": "no_results", "message": f"No contacts found for: {query}"}
+            if not resp.ok:
+                return {"status": "error", "message": resp.text}
+            contacts = [
+                {"id": c.get("id"), "first_name": c.get("First_Name", ""),
+                 "last_name": c.get("Last_Name", ""), "email": c.get("Email", ""),
+                 "phone": c.get("Phone", "")}
+                for c in resp.json().get("data", [])
+            ]
+            return {"status": "success", "count": len(contacts), "contacts": contacts}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def search_zoho_deals(stage: str = None) -> dict:
+        """List Zoho CRM deals, optionally filtered by pipeline stage.
+
+        Args:
+            stage: Deal stage to filter by, e.g. 'Qualification', 'Closed Won'.
+                   Pass None to return all deals.
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Zoho CRM not connected — go to Settings to connect Zoho."}
+        try:
+            fields = "Deal_Name,Amount,Stage,Closing_Date"
+            if stage:
+                resp = _get(f"{BASE}/Deals/search",
+                            params={"criteria": f"Stage:equals:{stage}", "fields": fields})
+            else:
+                resp = _get(f"{BASE}/Deals", params={"fields": fields})
+            if resp.status_code == 204:
+                return {"status": "no_results", "message": f"No deals found" + (f" in stage: {stage}" if stage else "")}
+            if not resp.ok:
+                return {"status": "error", "message": resp.text}
+            deals = [
+                {"id": d.get("id"), "deal_name": d.get("Deal_Name", ""),
+                 "amount": d.get("Amount"), "stage": d.get("Stage", ""),
+                 "closing_date": d.get("Closing_Date", "")}
+                for d in resp.json().get("data", [])
+            ]
+            return {"status": "success", "count": len(deals), "deals": deals}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_zoho_contact(contact_id: str) -> dict:
+        """Get full details of a single Zoho CRM contact by ID.
+
+        Args:
+            contact_id: The Zoho CRM contact ID (from search_zoho_contacts results)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Zoho CRM not connected — go to Settings to connect Zoho."}
+        try:
+            resp = _get(f"{BASE}/Contacts/{contact_id}")
+            if resp.status_code == 204:
+                return {"status": "no_results", "message": f"Contact not found: {contact_id}"}
+            if not resp.ok:
+                return {"status": "error", "message": resp.text}
+            data = resp.json().get("data", [])
+            if not data:
+                return {"status": "no_results", "message": f"Contact not found: {contact_id}"}
+            return {"status": "success", "contact": data[0]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_zoho_contacts, search_zoho_deals, get_zoho_contact]
+
+
+# ── Agent runner ──────────────────────────────────────────────────────────────
+
+def _build_tools(email: str) -> list:
+    tools = []
+    tools.append(_make_gmail_tool(email))
+    tools.append(_make_drive_tool(email))
+    tools += _make_slack_tools(email)
+    tools += _make_github_tools(email)
+    tools += _make_jira_tools(email)
+    tools += _make_zoho_tools(email)
+    return tools
+
+
+async def run_user_query(email: str, message: str) -> str:
+    """Run a query scoped entirely to one user's credentials. Returns the agent's response."""
+    tools = _build_tools(email)
+
+    agent = Agent(
+        model="gemini-2.5-flash",
+        name="kno_agent",
+        description="kno.ai — AI assistant for company knowledge",
+        instruction=_INSTRUCTION,
+        tools=tools,
+    )
+
+    runner = InMemoryRunner(agent=agent, app_name="kno")
+    session = await runner.session_service.create_session(app_name="kno", user_id=email)
+
+    response_text = ""
+    async for event in runner.run_async(
+        user_id=email,
+        session_id=session.id,
+        new_message=genai_types.Content(
+            role="user",
+            parts=[genai_types.Part(text=message)],
+        ),
+    ):
+        if event.is_final_response() and event.content and event.content.parts:
+            response_text = "".join(p.text for p in event.content.parts if hasattr(p, "text"))
+
+    return response_text

@@ -1,7 +1,12 @@
 google-adk>=1.0.0
 google-api-python-client>=2.0.0
 google-auth>=2.0.0
+google-cloud-firestore>=2.0.0
 python-dotenv>=1.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
 slack_sdk>=3.0.0
 requests>=2.28.0
 schedule>=1.2.0
+cryptography>=42.0.0
