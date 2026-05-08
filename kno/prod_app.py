@@ -280,6 +280,53 @@ def disconnect(app_name: str, email: str = Depends(current_user)):
     return {"status": "disconnected", "app": app_name}
 
 
+# ── Admin ─────────────────────────────────────────────────────────────────────
+
+ADMIN_EMAILS = {"dhana19.ece@gmail.com"}   # expand as needed
+
+@app.get("/admin/users", response_class=HTMLResponse)
+def admin_users(email: str = Depends(current_user)):
+    """Admin dashboard — shows all users and their connected apps."""
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admin access only")
+
+    from google.cloud import firestore
+    db = firestore.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT", "kno-ai-494516"))
+    users = list(db.collection("users").stream())
+
+    rows = ""
+    for doc in users:
+        d = doc.to_dict()
+        apps = list(d.get("connected_apps", {}).keys())
+        joined = d.get("created_at", "")[:10]
+        app_badges = "".join(
+            f'<span style="background:#34d399;color:#000;padding:2px 8px;border-radius:10px;font-size:12px;margin:2px;display:inline-block">{a}</span>'
+            for a in apps
+        ) or '<span style="color:#888">none connected</span>'
+        status_dot = "🟢" if apps else "🟡"
+        rows += f"""<tr>
+            <td style="padding:12px 16px">{status_dot}</td>
+            <td style="padding:12px 16px;font-family:monospace">{d.get('email','')}</td>
+            <td style="padding:12px 16px">{app_badges}</td>
+            <td style="padding:12px 16px;color:#888">{joined}</td>
+        </tr>"""
+
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>kno.ai Admin</title>
+<style>body{{font-family:system-ui,sans-serif;background:#0f0f13;color:#e8e8f0;margin:0;padding:32px}}
+h1{{font-size:22px;margin-bottom:4px}}p{{color:#888;margin-bottom:24px}}
+table{{width:100%;border-collapse:collapse;background:#18181f;border-radius:12px;overflow:hidden}}
+th{{text-align:left;padding:12px 16px;background:#22222c;color:#888;font-size:12px;text-transform:uppercase;letter-spacing:.5px}}
+tr:not(:last-child){{border-bottom:1px solid #2e2e3a}}
+</style></head><body>
+<h1>✦ kno.ai — Users</h1>
+<p>{len(users)} total · {sum(1 for d in [doc.to_dict() for doc in users] if d.get('connected_apps'))} active</p>
+<table><thead><tr><th></th><th>Email</th><th>Connected Apps</th><th>Joined</th></tr></thead>
+<tbody>{rows}</tbody></table>
+<p style="margin-top:16px;font-size:12px;color:#444">Logged in as {email} · <a href="/" style="color:#6c63ff">← Back to kno</a></p>
+</body></html>""")
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
