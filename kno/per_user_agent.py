@@ -260,32 +260,76 @@ def _make_github_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def list_github_repos() -> dict:
+        """List all GitHub repositories for the connected owner/org.
+
+        Returns:
+            All repos with name, description, and URL. Call this first if you
+            don't know the repo name before searching issues or PRs.
+        """
+        if not creds_data:
+            return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
+        try:
+            owner = creds_data.get("owner", "")
+            # Try org repos first, fall back to user repos
+            r = req.get(f"https://api.github.com/orgs/{owner}/repos",
+                        headers=_headers(), params={"per_page": 30, "sort": "updated"})
+            if r.status_code == 404:
+                r = req.get(f"https://api.github.com/users/{owner}/repos",
+                            headers=_headers(), params={"per_page": 30, "sort": "updated"})
+            repos = r.json() if r.ok else []
+            if not repos:
+                return {"status": "no_results", "message": f"No repos found for {owner}"}
+            return {"status": "success", "count": len(repos), "repos": [
+                {"name": rp["name"], "full_name": rp["full_name"],
+                 "description": rp.get("description", ""),
+                 "url": rp["html_url"], "updated": rp.get("updated_at", "")}
+                for rp in repos
+            ]}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     def get_github_pull_requests(repo: str = None, state: str = "open") -> dict:
         """List pull requests for a GitHub repo.
 
         Args:
-            repo: 'owner/repo' or bare repo name
+            repo: bare repo name (e.g. 'kno-ai') or 'owner/repo'. If omitted,
+                  lists PRs across ALL repos for the connected owner.
             state: 'open', 'closed', or 'all'
         """
         if not creds_data:
             return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
         try:
             owner = creds_data.get("owner", "")
-            full_repo = f"{owner}/{repo or owner}"
-            r = req.get(f"https://api.github.com/repos/{full_repo}/pulls",
-                        headers=_headers(), params={"state": state, "per_page": 20})
-            prs = r.json()
-            if not prs:
-                return {"status": "no_results", "message": f"No {state} PRs in {full_repo}"}
-            return {"status": "success", "count": len(prs), "pull_requests": [
-                {"number": p["number"], "title": p["title"],
-                 "author": p["user"]["login"], "url": p["html_url"]}
-                for p in prs
-            ]}
+            if repo:
+                repos_to_check = [f"{owner}/{repo}" if "/" not in repo else repo]
+            else:
+                # Get all repos and check each for PRs
+                r = req.get(f"https://api.github.com/users/{owner}/repos",
+                            headers=_headers(), params={"per_page": 20, "sort": "updated"})
+                if not r.ok:
+                    r = req.get(f"https://api.github.com/orgs/{owner}/repos",
+                                headers=_headers(), params={"per_page": 20, "sort": "updated"})
+                repos_to_check = [rp["full_name"] for rp in (r.json() if r.ok else [])]
+
+            all_prs = []
+            for full_repo in repos_to_check[:10]:  # cap at 10 repos
+                r = req.get(f"https://api.github.com/repos/{full_repo}/pulls",
+                            headers=_headers(), params={"state": state, "per_page": 10})
+                if r.ok:
+                    for p in r.json():
+                        all_prs.append({
+                            "repo": full_repo,
+                            "number": p["number"], "title": p["title"],
+                            "author": p["user"]["login"], "url": p["html_url"]
+                        })
+            if not all_prs:
+                return {"status": "no_results", "message": f"No {state} PRs found"}
+            return {"status": "success", "count": len(all_prs), "pull_requests": all_prs}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [search_github_issues, get_github_pull_requests]
+    return [list_github_repos, search_github_issues, get_github_pull_requests]
 
 
 def _make_jira_tools(email: str):
@@ -323,11 +367,11 @@ def _make_jira_tools(email: str):
                 jql_parts.append(f'status = "{status}"')
             jql = " AND ".join(jql_parts) + " ORDER BY updated DESC"
 
-            r = req.get(
-                _base("/rest/api/3/search"),
+            r = req.post(
+                _base("/rest/api/3/search/jql"),
                 auth=_auth(),
-                params={"jql": jql, "maxResults": max_results,
-                        "fields": "summary,status,assignee,priority,created,updated,description"},
+                json={"jql": jql, "maxResults": max_results,
+                      "fields": ["summary", "status", "assignee", "priority", "created", "updated"]},
             )
             if not r.ok:
                 return {"status": "error", "message": r.text}
