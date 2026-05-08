@@ -1,19 +1,50 @@
 """
 Multi-tenant agent runner.
 Each user's query executes with ONLY their own credentials — never another user's.
+Vertex AI Session Service gives persistent sessions across Cloud Run instances.
+Vertex AI Memory Bank gives long-term memory across conversations.
 """
 import os
 import base64
 from typing import Optional, AsyncGenerator
 
 from google.adk.agents.llm_agent import Agent
-from google.adk.runners import InMemoryRunner
+from google.adk.runners import Runner
+from google.adk.sessions import VertexAiSessionService, InMemorySessionService
+from google.adk.memory import VertexAiMemoryBankService, InMemoryMemoryService
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
+from google.adk.tools.load_memory_tool import LoadMemoryTool
 from google.genai import types as genai_types
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from kno.user_store import get_app_credentials
+
+# ── Vertex AI config ──────────────────────────────────────────────────────────
+_GCP_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT", "kno-ai-494516")
+_GCP_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+_USE_VERTEX   = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "0") == "1"
+
+# Build session + memory services once at module load
+# (Cloud Run keeps the module warm between requests)
+def _make_services():
+    if _USE_VERTEX:
+        session_svc = VertexAiSessionService(
+            project=_GCP_PROJECT,
+            location=_GCP_LOCATION,
+        )
+        memory_svc = VertexAiMemoryBankService(
+            project=_GCP_PROJECT,
+            location=_GCP_LOCATION,
+        )
+    else:
+        # Local dev fallback — in-memory, no GCP needed
+        session_svc = InMemorySessionService()
+        memory_svc  = InMemoryMemoryService()
+    return session_svc, memory_svc
+
+_session_service, _memory_service = _make_services()
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -23,8 +54,14 @@ SCOPES = [
 _INSTRUCTION = """You are kno, an AI assistant for company knowledge.
 Help employees find information from their connected tools quickly and accurately.
 
-If a tool returns "not connected", tell the user to go to Settings → Connect Apps.
-Always search before saying you don't know. Be concise. Cite your sources with links."""
+## Memory
+- At the start of every conversation, your memory is automatically preloaded with relevant past context.
+- Use load_memory to search long-term memory when the user references something from a past conversation ("last week", "that deal we discussed", "remember when...").
+- Important findings — deal names, key contacts, decisions, recurring topics — are automatically saved to memory after each session.
+
+## Tools
+- Always search before saying you don't know. Be concise. Cite your sources with links.
+- If a tool returns "not connected", tell the user to go to Settings → Connect Apps."""
 
 
 # ── Per-user Google services ──────────────────────────────────────────────────
@@ -518,7 +555,11 @@ def _make_zoho_tools(email: str):
 # ── Agent runner ──────────────────────────────────────────────────────────────
 
 def _build_tools(email: str) -> list:
-    tools = []
+    tools = [
+        # Memory tools come first so they're always available
+        PreloadMemoryTool(),
+        LoadMemoryTool(),
+    ]
     tools.append(_make_gmail_tool(email))
     tools.append(_make_drive_tool(email))
     tools += _make_slack_tools(email)
@@ -528,8 +569,17 @@ def _build_tools(email: str) -> list:
     return tools
 
 
-async def run_user_query(email: str, message: str) -> str:
-    """Run a query scoped entirely to one user's credentials. Returns the agent's response."""
+async def run_user_query(email: str, message: str, session_id: str = None) -> str:
+    """Run a query scoped entirely to one user's credentials.
+
+    Args:
+        email:      The authenticated user's email (used as user_id).
+        message:    The user's query text.
+        session_id: Optional — resume an existing session. If None, creates a new one.
+
+    Returns:
+        The agent's response as a string.
+    """
     tools = _build_tools(email)
 
     agent = Agent(
@@ -540,8 +590,26 @@ async def run_user_query(email: str, message: str) -> str:
         tools=tools,
     )
 
-    runner = InMemoryRunner(agent=agent, app_name="kno")
-    session = await runner.session_service.create_session(app_name="kno", user_id=email)
+    runner = Runner(
+        agent=agent,
+        app_name="kno",
+        session_service=_session_service,
+        memory_service=_memory_service,
+    )
+
+    # Reuse existing session or create a fresh one
+    if session_id:
+        try:
+            session = await _session_service.get_session(
+                app_name="kno", user_id=email, session_id=session_id
+            )
+        except Exception:
+            session = None
+    else:
+        session = None
+
+    if session is None:
+        session = await _session_service.create_session(app_name="kno", user_id=email)
 
     response_text = ""
     async for event in runner.run_async(
@@ -555,4 +623,4 @@ async def run_user_query(email: str, message: str) -> str:
         if event.is_final_response() and event.content and event.content.parts:
             response_text = "".join(p.text for p in event.content.parts if hasattr(p, "text"))
 
-    return response_text
+    return response_text, session.id

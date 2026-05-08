@@ -284,15 +284,20 @@ def disconnect(app_name: str, email: str = Depends(current_user)):
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: Optional[str] = None   # resume existing session
 
 
 @app.post("/chat")
 async def chat(body: ChatRequest, email: str = Depends(current_user)):
-    """Run a query against the current user's connected tools."""
+    """Run a query against the current user's connected tools.
+
+    Returns the agent response AND a session_id the client should send back
+    on the next turn to maintain conversation continuity.
+    """
     if not body.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
-    response = await run_user_query(email, body.message)
-    return {"response": response}
+    response, session_id = await run_user_query(email, body.message, body.session_id)
+    return {"response": response, "session_id": session_id}
 
 
 # ── Frontend ──────────────────────────────────────────────────────────────────

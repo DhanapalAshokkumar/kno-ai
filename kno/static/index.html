@@ -300,6 +300,7 @@
   // ── State ────────────────────────────────────────────────────────────────
   let userEmail = "";
   let connectedApps = {};
+  let currentSessionId = null;   // persists across turns in one browser session
   const messages = [];
 
   // ── Init ─────────────────────────────────────────────────────────────────
@@ -355,9 +356,10 @@
       const res = await fetch("/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, session_id: currentSessionId }),
       });
       const data = await res.json();
+      if (data.session_id) currentSessionId = data.session_id;
       removeTyping(typingId);
       appendMessage("assistant", data.response || data.detail || "No response.");
     } catch (e) {
