@@ -26,18 +26,31 @@ _GCP_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT", "kno-ai-494516")
 _GCP_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
 _USE_VERTEX   = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "0") == "1"
 
+# ── Service config ────────────────────────────────────────────────────────────
+# AGENT_ENGINE_ID is required for VertexAiMemoryBankService (long-term memory).
+# It's optional for VertexAiSessionService (persistent sessions still work without it).
+# Set AGENT_ENGINE_ID env var once a Vertex AI Agent Engine has been created.
+_AGENT_ENGINE_ID = os.environ.get("AGENT_ENGINE_ID", "")
+
 # Build session + memory services once at module load
 # (Cloud Run keeps the module warm between requests)
 def _make_services():
     if _USE_VERTEX:
+        # Persistent sessions across Cloud Run instances — no engine ID needed
         session_svc = VertexAiSessionService(
             project=_GCP_PROJECT,
             location=_GCP_LOCATION,
         )
-        memory_svc = VertexAiMemoryBankService(
-            project=_GCP_PROJECT,
-            location=_GCP_LOCATION,
-        )
+        # Long-term memory across sessions requires an Agent Engine
+        if _AGENT_ENGINE_ID:
+            memory_svc = VertexAiMemoryBankService(
+                project=_GCP_PROJECT,
+                location=_GCP_LOCATION,
+                agent_engine_id=_AGENT_ENGINE_ID,
+            )
+        else:
+            # Fallback: per-session memory only (no cross-session recall)
+            memory_svc = InMemoryMemoryService()
     else:
         # Local dev fallback — in-memory, no GCP needed
         session_svc = InMemorySessionService()
