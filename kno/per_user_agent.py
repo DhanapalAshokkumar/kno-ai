@@ -591,7 +591,7 @@ async def run_user_query(email: str, message: str, session_id: str = None) -> st
         session_id: Optional — resume an existing session. If None, creates a new one.
 
     Returns:
-        The agent's response as a string.
+        Tuple of (response_text, session_id).
     """
     tools = _build_tools(email)
 
@@ -603,9 +603,13 @@ async def run_user_query(email: str, message: str, session_id: str = None) -> st
         tools=tools,
     )
 
+    # VertexAiSessionService requires app_name = reasoning engine ID.
+    # InMemorySessionService accepts any string.
+    app_name = _AGENT_ENGINE_ID if (_USE_VERTEX and _AGENT_ENGINE_ID) else "kno"
+
     runner = Runner(
         agent=agent,
-        app_name="kno",
+        app_name=app_name,
         session_service=_session_service,
         memory_service=_memory_service,
     )
@@ -614,7 +618,7 @@ async def run_user_query(email: str, message: str, session_id: str = None) -> st
     if session_id:
         try:
             session = await _session_service.get_session(
-                app_name="kno", user_id=email, session_id=session_id
+                app_name=app_name, user_id=email, session_id=session_id
             )
         except Exception:
             session = None
@@ -622,7 +626,9 @@ async def run_user_query(email: str, message: str, session_id: str = None) -> st
         session = None
 
     if session is None:
-        session = await _session_service.create_session(app_name="kno", user_id=email)
+        session = await _session_service.create_session(
+            app_name=app_name, user_id=email
+        )
 
     response_text = ""
     async for event in runner.run_async(
