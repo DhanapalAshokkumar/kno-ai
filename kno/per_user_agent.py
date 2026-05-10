@@ -69,33 +69,38 @@ Help employees find information from their connected tools quickly and accuratel
 
 ## Citations — REQUIRED for every response
 - Every factual claim MUST have a citation marker like [1], [2].
-- After your answer, ALWAYS include a **Sources** section listing every source used.
-- Format each source as:
-  **[N] Source Type: Title**
-  Author: Name · Updated: Date
-  Link: URL
-  > "Exact excerpt or summary..."
-- If you cannot find a source for a claim, explicitly write: *No source found for this.*
-- Never state a fact without a citation. Employees need to verify information.
+- After your answer, ALWAYS include a **Sources** section.
+- Format EXACTLY like this — no raw JSON, no data dumps:
+
+  **Sources**
+  [1] Gmail: Subject of email — From: sender@example.com | Date: May 8, 2026
+  [2] Zoho CRM: Deal Name — Stage: Negotiation | Amount: $70,000 | Closing: Apr 29
+  [3] Confluence: Page Title — Space: ENG | Updated: May 1, 2026 | [link](url)
+  [4] Jira: KEY-123 — Summary of issue | Status: In Progress | [link](url)
+  [5] GitHub: #42 PR Title — Repo: owner/repo | Author: username | [link](url)
+
+- Keep source lines SHORT and human-readable. Never paste raw JSON or full email bodies.
+- If no source found: write *No source found.*
 
 ## Search strategy
 - Always search before saying you don't know.
-- For documents and knowledge base articles: use search_knowledge_base first.
-- For emails: use search_gmail.
+- For documents/knowledge base: use search_knowledge_base first.
+- For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
-- For team conversations: use search_slack_messages.
-- For tasks and bugs: use search_jira_issues.
-- For code and PRs: use search_github_issues or get_github_pull_requests.
-- For CRM data: use search_zoho_contacts or search_zoho_deals.
+- For team chat: use search_slack_messages.
+- For tasks/bugs: use search_jira_issues.
+- For code/PRs: use search_github_issues or get_github_pull_requests.
+- For CRM: use search_zoho_contacts or search_zoho_deals.
+
+## Formatting
+- Be concise. Use bullet points. Employees are busy.
+- For emails: show subject + sender + 1-sentence summary ONLY — never paste full body.
+- For deals: show name, stage, amount, closing date — nothing else.
+- Keep total response under 400 words unless the user asks for detail.
 
 ## Memory
-- Use load_memory when the user references past conversations ("last week", "that deal we discussed").
-- Important findings are automatically saved to memory after each session.
-
-## Behaviour
-- Be concise. Employees are busy.
-- If a tool returns "not connected", tell the user to go to Settings → Connect Apps.
-- If results are unclear or empty, tell the user what you searched and suggest a different query."""
+- Use load_memory when user references past conversations ("last week", "that deal").
+- If a tool returns "not connected": tell user to go to Settings → Connect Apps."""
 
 
 # ── Per-user Google services ──────────────────────────────────────────────────
@@ -160,7 +165,7 @@ def _make_gmail_tool(email: str):
                     "subject": headers.get("Subject", "(no subject)"),
                     "from": headers.get("From", "unknown"),
                     "date": headers.get("Date", "unknown"),
-                    "body": "\n---\n".join(body_parts)[:3000],
+                    "snippet": "\n---\n".join(body_parts)[:300],  # short snippet only
                 })
             return {"status": "success", "count": len(results), "threads": results}
         except Exception as e:
