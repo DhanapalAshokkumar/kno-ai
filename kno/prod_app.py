@@ -280,6 +280,71 @@ def disconnect(app_name: str, email: str = Depends(current_user)):
     return {"status": "disconnected", "app": app_name}
 
 
+# ── Knowledge base ingestion ──────────────────────────────────────────────────
+
+@app.post("/admin/ingest/confluence")
+async def ingest_confluence(email: str = Depends(current_user)):
+    """Ingest all Confluence pages into the RAG knowledge base corpus."""
+    if email not in {"dhana19.ece@gmail.com"}:
+        raise HTTPException(status_code=403, detail="Admin only")
+
+    import re
+    import requests as req
+    from kno.rag_connector import ingest_text
+
+    creds = get_app_credentials(email, "jira")
+    if not creds:
+        raise HTTPException(status_code=400, detail="Jira/Confluence not connected")
+
+    auth = (creds["email"], creds["api_token"])
+    site  = creds["site"]
+    base  = f"https://{site}"
+
+    # List all Confluence spaces
+    spaces_r = req.get(f"{base}/wiki/rest/api/space", auth=auth, params={"limit": 50})
+    spaces = spaces_r.json().get("results", []) if spaces_r.ok else []
+
+    ingested, failed = 0, 0
+    for space in spaces:
+        key = space["key"]
+        # Get pages in this space
+        pages_r = req.get(
+            f"{base}/wiki/rest/api/content",
+            auth=auth,
+            params={"spaceKey": key, "type": "page", "limit": 50,
+                    "expand": "body.storage,version,history.lastUpdated"},
+        )
+        if not pages_r.ok:
+            continue
+        for page in pages_r.json().get("results", []):
+            title   = page.get("title", "")
+            page_id = page["id"]
+            url     = f"{base}/wiki{page.get('_links',{}).get('webui','')}"
+            updated = page.get("version", {}).get("when", "")[:10]
+            author  = page.get("history", {}).get("lastUpdated", {}).get("by", {}).get("displayName", "")
+
+            # Strip HTML from storage format
+            raw_html = page.get("body", {}).get("storage", {}).get("value", "")
+            text = re.sub(r"<[^>]+>", " ", raw_html)
+            text = re.sub(r"\s+", " ", text).strip()
+
+            if not text:
+                continue
+
+            ok = ingest_text(
+                text=text, display_name=title,
+                source="confluence", url=url,
+                author=author, modified_date=updated,
+            )
+            if ok:
+                ingested += 1
+            else:
+                failed += 1
+
+    return {"status": "done", "ingested": ingested, "failed": failed,
+            "spaces": len(spaces)}
+
+
 # ── Admin ─────────────────────────────────────────────────────────────────────
 
 ADMIN_EMAILS = {"dhana19.ece@gmail.com"}   # expand as needed
