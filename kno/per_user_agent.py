@@ -67,14 +67,35 @@ SCOPES = [
 _INSTRUCTION = """You are kno, an AI assistant for company knowledge.
 Help employees find information from their connected tools quickly and accurately.
 
-## Memory
-- At the start of every conversation, your memory is automatically preloaded with relevant past context.
-- Use load_memory to search long-term memory when the user references something from a past conversation ("last week", "that deal we discussed", "remember when...").
-- Important findings — deal names, key contacts, decisions, recurring topics — are automatically saved to memory after each session.
+## Citations — REQUIRED for every response
+- Every factual claim MUST have a citation marker like [1], [2].
+- After your answer, ALWAYS include a **Sources** section listing every source used.
+- Format each source as:
+  **[N] Source Type: Title**
+  Author: Name · Updated: Date
+  Link: URL
+  > "Exact excerpt or summary..."
+- If you cannot find a source for a claim, explicitly write: *No source found for this.*
+- Never state a fact without a citation. Employees need to verify information.
 
-## Tools
-- Always search before saying you don't know. Be concise. Cite your sources with links.
-- If a tool returns "not connected", tell the user to go to Settings → Connect Apps."""
+## Search strategy
+- Always search before saying you don't know.
+- For documents and knowledge base articles: use search_knowledge_base first.
+- For emails: use search_gmail.
+- For files: use search_drive.
+- For team conversations: use search_slack_messages.
+- For tasks and bugs: use search_jira_issues.
+- For code and PRs: use search_github_issues or get_github_pull_requests.
+- For CRM data: use search_zoho_contacts or search_zoho_deals.
+
+## Memory
+- Use load_memory when the user references past conversations ("last week", "that deal we discussed").
+- Important findings are automatically saved to memory after each session.
+
+## Behaviour
+- Be concise. Employees are busy.
+- If a tool returns "not connected", tell the user to go to Settings → Connect Apps.
+- If results are unclear or empty, tell the user what you searched and suggest a different query."""
 
 
 # ── Per-user Google services ──────────────────────────────────────────────────
@@ -611,12 +632,55 @@ def _make_zoho_tools(email: str):
 
 # ── Agent runner ──────────────────────────────────────────────────────────────
 
+def _make_rag_tool():
+    """Wrap the RAG knowledge base search as an ADK-compatible tool."""
+    try:
+        from kno.rag_connector import search_knowledge_base as _rag_search
+
+        def search_knowledge_base(query: str) -> dict:
+            """Search the company knowledge base (Confluence + Drive documents) for information.
+
+            Use this FIRST for any question about company processes, policies, how-tos,
+            product specs, or internal documentation. Returns passages with source citations.
+
+            Args:
+                query: Natural language search query, e.g. 'onboarding process for engineers'
+            """
+            results = _rag_search(query, top_k=5)
+            if not results:
+                return {"status": "no_results", "message": f"No knowledge base articles found for: {query}"}
+            return {
+                "status": "success",
+                "count": len(results),
+                "passages": [
+                    {
+                        "title": r["title"],
+                        "excerpt": r["text"][:400],
+                        "url": r["url"],
+                        "author": r["author"],
+                        "date": r["date"],
+                        "source": r["source"],
+                    }
+                    for r in results
+                ],
+            }
+
+        return search_knowledge_base
+    except Exception:
+        return None
+
+
 def _build_tools(email: str) -> list:
     tools = [
         # Memory tools come first so they're always available
         PreloadMemoryTool(),
         LoadMemoryTool(),
     ]
+    # RAG knowledge base (Confluence + Drive semantic search)
+    rag_tool = _make_rag_tool()
+    if rag_tool:
+        tools.append(rag_tool)
+
     tools.append(_make_gmail_tool(email))
     tools.append(_make_drive_tool(email))
     tools += _make_slack_tools(email)
