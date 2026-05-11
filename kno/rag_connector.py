@@ -23,7 +23,7 @@ import math
 import os
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 import vertexai
@@ -145,39 +145,91 @@ def ingest_text(
         return False
 
 
-def search_knowledge_base(query: str, top_k: int = 5) -> list[dict]:
+def _parse_date(date_str: str) -> Optional[datetime]:
+    """Parse a date string in common formats into a UTC-aware datetime."""
+    if not date_str:
+        return None
+    # Normalise: strip microseconds and trailing Z for consistent parsing
+    s = date_str.strip()
+    # "2026-05-11T17:54:31.123456+00:00" → "2026-05-11T17:54:31+00:00"
+    import re as _re
+    s = _re.sub(r"\.\d+", "", s)       # remove fractional seconds
+    s = s.replace("Z", "+00:00")        # replace Z with explicit UTC offset
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(s[:len(fmt) + 6], fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None
+
+
+def search_knowledge_base(query: str, top_k: int = 5,
+                           days_ago: int = None,
+                           author: str = None,
+                           source_type: str = None) -> list[dict]:
     """Semantic search over the knowledge base using text-embedding-004.
 
-    1. Embeds the query with task_type="RETRIEVAL_QUERY".
-    2. Fetches all stored document embeddings from Firestore.
-    3. Ranks by cosine similarity; falls back to keyword scoring for
-       legacy docs that have no embedding yet.
-    4. Suppresses results below the cosine threshold (0.55).
+    Optionally pre-filters documents by metadata before running cosine
+    similarity, so the ranking pool is already restricted to matching docs.
 
     Args:
-        query:  Natural language question or keywords.
-        top_k:  Max results to return (default 5).
+        query:       Natural language question or keywords.
+        top_k:       Max results to return (default 5).
+        days_ago:    Only consider docs whose modified_date or ingested_at
+                     falls within the last N days.
+        author:      Case-insensitive substring match against the author field.
+        source_type: Exact match against the source field, e.g. "confluence".
 
     Returns:
         List of dicts — keys: text, source, title, url, author, date, score
     """
     try:
-        db = _get_db()
+        db   = _get_db()
         docs = list(db.collection(_COLLECTION).stream())
         if not docs:
             return []
 
-        # Embed the query once
+        # ── Metadata pre-filter ───────────────────────────────────────────────
+        ts_cutoff = (datetime.now(timezone.utc) - timedelta(days=days_ago)
+                     if days_ago else None)
+
+        filtered = []
+        for doc in docs:
+            d = doc.to_dict()
+
+            # source_type filter (exact match on the 'source' field)
+            if source_type and d.get("source", "").lower() != source_type.lower():
+                continue
+
+            # author filter (case-insensitive substring)
+            if author and author.lower() not in d.get("author", "").lower():
+                continue
+
+            # days_ago filter — try modified_date first, fall back to ingested_at
+            if ts_cutoff:
+                date_str = d.get("modified_date") or d.get("ingested_at", "")
+                doc_dt   = _parse_date(date_str)
+                if doc_dt and doc_dt < ts_cutoff:
+                    continue
+
+            filtered.append((doc, d))
+
+        if not filtered:
+            return []
+
+        # ── Embed query once ──────────────────────────────────────────────────
         try:
             query_vec = _embed(query, task_type="RETRIEVAL_QUERY")
         except Exception as e:
             logger.warning("Embedding failed (%s); falling back to keyword search", e)
             query_vec = None
 
+        # ── Score each surviving doc ──────────────────────────────────────────
         scored: list[tuple[float, dict]] = []
-
-        for doc in docs:
-            d          = doc.to_dict()
+        for _, d in filtered:
             title      = d.get("title", "Unknown")
             text       = d.get("text", "")
             stored_vec = d.get("embedding")
@@ -185,13 +237,11 @@ def search_knowledge_base(query: str, top_k: int = 5) -> list[dict]:
             if query_vec and stored_vec:
                 score = _cosine(query_vec, stored_vec)
             else:
-                # Legacy doc or embedding failure — keyword fallback
                 score = _keyword_score(title, text, query)
 
             if score >= _SIM_THRESHOLD:
-                snippet = _extract_snippet(text, query)
                 scored.append((score, {
-                    "text":   snippet,
+                    "text":   _extract_snippet(text, query),
                     "title":  title,
                     "source": d.get("source", ""),
                     "url":    d.get("url", ""),

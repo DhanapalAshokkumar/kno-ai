@@ -6,6 +6,7 @@ Vertex AI Memory Bank gives long-term memory across conversations.
 """
 import os
 import base64
+from datetime import datetime, timezone, timedelta
 from typing import Optional, AsyncGenerator
 
 from google.adk.agents.llm_agent import Agent
@@ -20,6 +21,30 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from kno.user_store import get_app_credentials
+
+
+# ── Shared date helper ────────────────────────────────────────────────────────
+
+def _cutoff_dt(days_ago: Optional[int]) -> Optional[datetime]:
+    """Return a UTC datetime N days in the past, or None."""
+    if days_ago is None:
+        return None
+    return datetime.now(timezone.utc) - timedelta(days=days_ago)
+
+
+def _gmail_after(days_ago: Optional[int]) -> str:
+    """Return a Gmail 'after:YYYY/MM/DD' token, or empty string."""
+    if days_ago is None:
+        return ""
+    dt = _cutoff_dt(days_ago)
+    return f" after:{dt.strftime('%Y/%m/%d')}"
+
+
+def _ts_after(days_ago: Optional[int]) -> Optional[float]:
+    """Return a Unix timestamp cutoff, or None."""
+    if days_ago is None:
+        return None
+    return _cutoff_dt(days_ago).timestamp()
 
 # ── Vertex AI config ──────────────────────────────────────────────────────────
 _GCP_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT", "kno-ai-494516")
@@ -106,6 +131,25 @@ Help employees find information from their connected tools quickly and accuratel
 - For deals: show name, stage, amount, closing date — nothing else.
 - Keep total response under 400 words unless the user asks for detail.
 
+## Metadata filters — use these whenever the user implies time, person, or source
+Every search tool accepts optional filter parameters. Apply them proactively:
+
+| User says | Filter to use |
+|---|---|
+| "recently", "last week", "this week" | days_ago=7 |
+| "last month", "past month" | days_ago=30 |
+| "today", "yesterday" | days_ago=1 |
+| "last 90 days", "this quarter" | days_ago=90 |
+| "by Alice", "from Bob", "Alice's" | author="Alice" |
+| "in Confluence", "Confluence pages" | source_type="confluence" (KB only) |
+| "in Gmail" / "emails" | use search_gmail directly |
+
+Rules:
+- ALWAYS add days_ago when user says "recent", "latest", "last N days/weeks/months".
+- ALWAYS add author when user names a person in context of finding content.
+- For search_knowledge_base only: add source_type to limit to one source ("confluence", "github", etc.).
+- Do NOT invent filters the user didn't imply.
+
 ## Memory
 - Use load_memory when user references past conversations ("last week", "that deal").
 - If a tool returns "not connected": tell user to go to Settings → Connect Apps."""
@@ -131,18 +175,26 @@ def _google_creds(creds_data: dict) -> Credentials:
 def _make_gmail_tool(email: str):
     creds_data = get_app_credentials(email, "gmail")
 
-    def search_gmail(query: str, max_results: int = 5) -> dict:
+    def search_gmail(query: str, max_results: int = 5,
+                     days_ago: int = None, author: str = None) -> dict:
         """Search Gmail for emails and threads matching a query.
 
         Args:
-            query: Gmail search query, e.g. 'from:boss@company.com budget'
+            query: Gmail search query, e.g. 'budget approval'
             max_results: Max threads to return (default 5)
+            days_ago: Only return emails from the last N days (e.g. 7, 30)
+            author: Filter by sender name or email, e.g. 'alice@company.com'
         """
         if not creds_data:
             return {"status": "error", "message": "Gmail not connected — go to Settings to connect your Gmail."}
         try:
             svc = build("gmail", "v1", credentials=_google_creds(creds_data))
-            resp = svc.users().threads().list(userId="me", q=query, maxResults=max_results).execute()
+            # Build Gmail query string with optional filters
+            full_query = query
+            full_query += _gmail_after(days_ago)
+            if author:
+                full_query += f" from:{author}"
+            resp = svc.users().threads().list(userId="me", q=full_query, maxResults=max_results).execute()
             threads = resp.get("threads", [])
             if not threads:
                 return {"status": "no_results", "message": f"No emails found for: {query}"}
@@ -185,19 +237,26 @@ def _make_gmail_tool(email: str):
 def _make_drive_tool(email: str):
     creds_data = get_app_credentials(email, "gmail")  # Gmail and Drive share OAuth
 
-    def search_drive(query: str, max_results: int = 5) -> dict:
+    def search_drive(query: str, max_results: int = 5,
+                     days_ago: int = None, author: str = None) -> dict:
         """Search Google Drive for files matching a query.
 
         Args:
             query: Keyword search, e.g. 'Q3 roadmap deck'
             max_results: Max files to return (default 5)
+            days_ago: Only return files modified in the last N days
+            author: Filter by owner display name, e.g. 'Alice Smith'
         """
         if not creds_data:
             return {"status": "error", "message": "Google Drive not connected — go to Settings to connect your Google account."}
         try:
             svc = build("drive", "v3", credentials=_google_creds(creds_data))
+            drive_q = f"fullText contains '{query}' and trashed=false"
+            if days_ago:
+                cutoff = _cutoff_dt(days_ago).strftime("%Y-%m-%dT%H:%M:%S")
+                drive_q += f" and modifiedTime > '{cutoff}'"
             resp = svc.files().list(
-                q=f"fullText contains '{query}' and trashed=false",
+                q=drive_q,
                 pageSize=max_results,
                 fields="files(id,name,mimeType,modifiedTime,webViewLink,owners)",
             ).execute()
@@ -233,6 +292,13 @@ def _make_drive_tool(email: str):
                         pass
                 results.append(file_entry)
 
+            # Post-filter by author/owner display name
+            if author:
+                author_l = author.lower()
+                results = [f for f in results if author_l in f.get("owner", "").lower()]
+
+            if not results:
+                return {"status": "no_results", "message": f"No files found for: {query}"}
             return {"status": "success", "count": len(results), "files": results}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -246,13 +312,33 @@ def _make_slack_tools(email: str):
 
     creds_data = get_app_credentials(email, "slack")
 
-    def get_slack_activity() -> dict:
+    # Shared user-ID resolver (cached per tool-factory call)
+    _slack_user_cache: dict = {}
+
+    def _resolve_slack_user(cli, uid: str) -> str:
+        if not uid or uid.startswith("B"):
+            return uid
+        if uid in _slack_user_cache:
+            return _slack_user_cache[uid]
+        try:
+            info = cli.users_info(user=uid)
+            name = (info.get("user") or {}).get("real_name") or \
+                   (info.get("user") or {}).get("name") or uid
+            _slack_user_cache[uid] = name
+            return name
+        except Exception:
+            return uid
+
+    def get_slack_activity(days_ago: int = None, author: str = None) -> dict:
         """Return recent messages from the most active Slack channels.
 
         Call this for ANY question about recent Slack activity, e.g.:
         "What has been discussed in Slack?", "What's happening in Slack?",
         "Any recent updates?", "Summarise Slack", "What's been said in #general?"
-        No parameters needed — just call it immediately.
+
+        Args:
+            days_ago: Only return messages from the last N days (e.g. 7)
+            author: Filter by author display name, e.g. 'Alice'
         """
         if not creds_data:
             return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
@@ -261,22 +347,7 @@ def _make_slack_tools(email: str):
             if not token:
                 return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
             cli = WebClient(token=token)
-
-            # Cache user ID → display name lookups
-            _user_cache: dict = {}
-            def _resolve_user(uid: str) -> str:
-                if not uid or uid.startswith("B"):  # skip bot IDs
-                    return uid
-                if uid in _user_cache:
-                    return _user_cache[uid]
-                try:
-                    info = cli.users_info(user=uid)
-                    name = (info.get("user") or {}).get("real_name") or \
-                           (info.get("user") or {}).get("name") or uid
-                    _user_cache[uid] = name
-                    return name
-                except Exception:
-                    return uid
+            ts_cutoff = _ts_after(days_ago)
 
             try:
                 ch_resp = cli.conversations_list(
@@ -291,17 +362,23 @@ def _make_slack_tools(email: str):
             results = []
             for ch in all_channels[:6]:
                 try:
-                    hist = cli.conversations_history(channel=ch["id"], limit=10)
+                    kwargs = {"channel": ch["id"], "limit": 20}
+                    if ts_cutoff:
+                        kwargs["oldest"] = str(ts_cutoff)
+                    hist = cli.conversations_history(**kwargs)
                     for msg in hist.get("messages", []):
                         text = msg.get("text", "").strip()
                         if not text or msg.get("subtype"):
                             continue
-                        ts_raw = msg.get("ts", "")
-                        uid = msg.get("user", msg.get("username", ""))
+                        ts_raw      = msg.get("ts", "")
+                        uid         = msg.get("user", msg.get("username", ""))
+                        author_name = _resolve_slack_user(cli, uid) if uid else "unknown"
+                        if author and author.lower() not in author_name.lower():
+                            continue
                         results.append({
-                            "channel": ch.get("name", "unknown"),
-                            "author": _resolve_user(uid) if uid else "unknown",
-                            "text": text[:400],
+                            "channel":   ch.get("name", "unknown"),
+                            "author":    author_name,
+                            "text":      text[:400],
                             "timestamp": ts_raw,
                             "permalink": f"https://slack.com/archives/{ch['id']}/p{ts_raw.replace('.','')}" if ts_raw else "",
                         })
@@ -314,7 +391,8 @@ def _make_slack_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def search_slack_messages(query: str, count: int = 10) -> dict:
+    def search_slack_messages(query: str, count: int = 10,
+                              days_ago: int = None, author: str = None) -> dict:
         """Search Slack for messages containing a specific keyword or phrase.
 
         Use this ONLY when the user names a specific topic to look for,
@@ -324,6 +402,8 @@ def _make_slack_tools(email: str):
         Args:
             query: Keyword or phrase to search for (required)
             count: Max messages to return (default 10)
+            days_ago: Only return messages from the last N days
+            author: Filter by author display name, e.g. 'Alice'
         """
         if not creds_data:
             return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
@@ -332,30 +412,22 @@ def _make_slack_tools(email: str):
             if not token:
                 return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
             cli = WebClient(token=token)
-            resp = cli.search_messages(query=query, count=count, sort="timestamp", sort_dir="desc")
+            # Slack Search API supports "after:YYYY-MM-DD" in query string
+            full_query = query
+            if days_ago:
+                cutoff_date = _cutoff_dt(days_ago).strftime("%Y-%m-%d")
+                full_query += f" after:{cutoff_date}"
+            if author:
+                full_query += f" from:{author}"
+            resp = cli.search_messages(query=full_query, count=count, sort="timestamp", sort_dir="desc")
             matches = resp.get("messages", {}).get("matches", [])
             if not matches:
                 return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
-            # Resolve user IDs to display names
-            _user_cache: dict = {}
-            def _resolve(uid: str) -> str:
-                if not uid:
-                    return "unknown"
-                if uid in _user_cache:
-                    return _user_cache[uid]
-                try:
-                    info = cli.users_info(user=uid)
-                    name = (info.get("user") or {}).get("real_name") or \
-                           (info.get("user") or {}).get("name") or uid
-                    _user_cache[uid] = name
-                    return name
-                except Exception:
-                    return uid
 
             return {"status": "success", "count": len(matches), "messages": [
                 {
                     "channel": m.get("channel", {}).get("name", "unknown"),
-                    "author": _resolve(m.get("user", m.get("username", ""))),
+                    "author": _resolve_slack_user(cli, m.get("user", m.get("username", ""))),
                     "text": m.get("text", "")[:400],
                     "timestamp": m.get("ts", ""),
                     "permalink": m.get("permalink", ""),
@@ -379,19 +451,27 @@ def _make_github_tools(email: str):
         token = creds_data.get("token", "") if creds_data else ""
         return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
 
-    def search_github_issues(query: str, repo: str = None, state: str = "open") -> dict:
+    def search_github_issues(query: str, repo: str = None, state: str = "open",
+                             days_ago: int = None, author: str = None) -> dict:
         """Search GitHub issues by keyword.
 
         Args:
             query: Text to search in issue titles/bodies
             repo: 'owner/repo' or bare repo name
             state: 'open', 'closed', or 'all'
+            days_ago: Only return issues updated in the last N days
+            author: Filter by issue author (GitHub username)
         """
         if not creds_data:
             return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
         try:
             owner = creds_data.get("owner", "")
             q = f"{query} repo:{owner}/{repo or owner} is:issue state:{state}"
+            if days_ago:
+                cutoff = _cutoff_dt(days_ago).strftime("%Y-%m-%d")
+                q += f" updated:>{cutoff}"
+            if author:
+                q += f" author:{author}"
             r = req.get("https://api.github.com/search/issues",
                         headers=_headers(), params={"q": q, "per_page": 10})
             items = r.json().get("items", [])
@@ -445,13 +525,16 @@ def _make_github_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def get_github_pull_requests(repo: str = None, state: str = "open") -> dict:
+    def get_github_pull_requests(repo: str = None, state: str = "open",
+                                  days_ago: int = None, author: str = None) -> dict:
         """List pull requests for a GitHub repo.
 
         Args:
             repo: bare repo name (e.g. 'kno-ai') or 'owner/repo'. If omitted,
                   lists PRs across ALL repos for the connected owner.
             state: 'open', 'closed', or 'all'
+            days_ago: Only return PRs updated in the last N days
+            author: Filter by PR author (GitHub username)
         """
         if not creds_data:
             return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
@@ -468,16 +551,31 @@ def _make_github_tools(email: str):
                                 headers=_headers(), params={"per_page": 20, "sort": "updated"})
                 repos_to_check = [rp["full_name"] for rp in (r.json() if r.ok else [])]
 
+            ts_cutoff = _cutoff_dt(days_ago) if days_ago else None
             all_prs = []
             for full_repo in repos_to_check[:10]:  # cap at 10 repos
                 r = req.get(f"https://api.github.com/repos/{full_repo}/pulls",
-                            headers=_headers(), params={"state": state, "per_page": 10})
+                            headers=_headers(), params={"state": state, "per_page": 20})
                 if r.ok:
                     for p in r.json():
+                        # days_ago filter: check updated_at
+                        if ts_cutoff:
+                            updated = p.get("updated_at", "")
+                            try:
+                                pr_dt = datetime.strptime(updated, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                                if pr_dt < ts_cutoff:
+                                    continue
+                            except ValueError:
+                                pass
+                        # author filter
+                        pr_author = p["user"]["login"]
+                        if author and author.lower() not in pr_author.lower():
+                            continue
                         all_prs.append({
                             "repo": full_repo,
                             "number": p["number"], "title": p["title"],
-                            "author": p["user"]["login"], "url": p["html_url"]
+                            "author": pr_author, "url": p["html_url"],
+                            "updated": p.get("updated_at", ""),
                         })
             if not all_prs:
                 return {"status": "no_results", "message": f"No {state} PRs found"}
@@ -503,7 +601,9 @@ def _make_jira_tools(email: str):
         site = creds_data["site"] if creds_data else ""
         return f"https://{site}{path}"
 
-    def search_jira_issues(query: str, project: str = None, status: str = None, max_results: int = 10) -> dict:
+    def search_jira_issues(query: str, project: str = None, status: str = None,
+                           max_results: int = 10, days_ago: int = None,
+                           author: str = None) -> dict:
         """Search Jira issues by text, project, and status.
 
         Args:
@@ -511,6 +611,8 @@ def _make_jira_tools(email: str):
             project: Jira project key, e.g. 'ENG' or 'KNO'
             status: Issue status filter, e.g. 'In Progress', 'Done', 'To Do'
             max_results: Max issues to return (default 10)
+            days_ago: Only return issues updated in the last N days
+            author: Filter by assignee or reporter display name
         """
         if not creds_data:
             return {"status": "error", "message": "Jira not connected — go to Settings to connect Jira."}
@@ -521,6 +623,10 @@ def _make_jira_tools(email: str):
                 jql_parts.append(f'project = "{proj}"')
             if status:
                 jql_parts.append(f'status = "{status}"')
+            if days_ago:
+                jql_parts.append(f'updated >= "-{days_ago}d"')
+            if author:
+                jql_parts.append(f'(assignee = "{author}" OR reporter = "{author}")')
             jql = " AND ".join(jql_parts) + " ORDER BY updated DESC"
 
             r = req.post(
@@ -590,20 +696,30 @@ def _make_jira_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def search_confluence_pages(query: str, space: str = None, max_results: int = 5) -> dict:
+    def search_confluence_pages(query: str, space: str = None, max_results: int = 5,
+                                days_ago: int = None, author: str = None) -> dict:
         """Search Confluence knowledge base pages.
 
         Args:
             query: Text to search for
             space: Confluence space key to restrict search (optional)
             max_results: Max pages to return (default 5)
+            days_ago: Only return pages last modified within N days
+            author: Filter by contributor/author display name
         """
         if not creds_data:
             return {"status": "error", "message": "Confluence not connected — go to Settings to connect Jira/Confluence."}
         try:
             sp = space or creds_data.get("confluence_space", "")
-            params = {"cql": f'type=page AND text ~ "{query}"' + (f' AND space = "{sp}"' if sp else ""),
-                      "limit": max_results, "expand": "version"}
+            cql = f'type=page AND text ~ "{query}"'
+            if sp:
+                cql += f' AND space = "{sp}"'
+            if days_ago:
+                cutoff = _cutoff_dt(days_ago).strftime("%Y-%m-%d")
+                cql += f' AND lastModified >= "{cutoff}"'
+            if author:
+                cql += f' AND contributor.fullname = "{author}"'
+            params = {"cql": cql, "limit": max_results, "expand": "version"}
             r = req.get(_base("/wiki/rest/api/content/search"), auth=_auth(), params=params)
             if not r.ok:
                 return {"status": "error", "message": r.text}
@@ -711,17 +827,20 @@ def _make_zoho_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    def search_zoho_deals(stage: str = None) -> dict:
-        """List Zoho CRM deals, optionally filtered by pipeline stage.
+    def search_zoho_deals(stage: str = None, days_ago: int = None,
+                          owner: str = None) -> dict:
+        """List Zoho CRM deals, optionally filtered by pipeline stage, recency, or owner.
 
         Args:
             stage: Deal stage to filter by, e.g. 'Qualification', 'Closed Won'.
                    Pass None to return all deals.
+            days_ago: Only return deals modified in the last N days
+            owner: Filter by deal owner/rep name, e.g. 'Alice'
         """
         if not creds_data:
             return {"status": "error", "message": "Zoho CRM not connected — go to Settings to connect Zoho."}
         try:
-            fields = "Deal_Name,Amount,Stage,Closing_Date"
+            fields = "Deal_Name,Amount,Stage,Closing_Date,Modified_Time,Owner"
             if stage:
                 resp = _get(f"{BASE}/Deals/search",
                             params={"criteria": f"Stage:equals:{stage}", "fields": fields})
@@ -731,12 +850,33 @@ def _make_zoho_tools(email: str):
                 return {"status": "no_results", "message": f"No deals found" + (f" in stage: {stage}" if stage else "")}
             if not resp.ok:
                 return {"status": "error", "message": resp.text}
-            deals = [
-                {"id": d.get("id"), "deal_name": d.get("Deal_Name", ""),
-                 "amount": d.get("Amount"), "stage": d.get("Stage", ""),
-                 "closing_date": d.get("Closing_Date", "")}
-                for d in resp.json().get("data", [])
-            ]
+
+            ts_cutoff = _cutoff_dt(days_ago)
+            deals = []
+            for d in resp.json().get("data", []):
+                # days_ago filter
+                if ts_cutoff:
+                    mod = d.get("Modified_Time", "")
+                    try:
+                        mod_dt = datetime.strptime(mod[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                        if mod_dt < ts_cutoff:
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                # owner filter
+                deal_owner = (d.get("Owner") or {}).get("name", "")
+                if owner and owner.lower() not in deal_owner.lower():
+                    continue
+                deals.append({
+                    "id": d.get("id"),
+                    "deal_name": d.get("Deal_Name", ""),
+                    "amount": d.get("Amount"),
+                    "stage": d.get("Stage", ""),
+                    "closing_date": d.get("Closing_Date", ""),
+                    "owner": deal_owner,
+                })
+            if not deals:
+                return {"status": "no_results", "message": "No deals matched the filters."}
             return {"status": "success", "count": len(deals), "deals": deals}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -772,16 +912,22 @@ def _make_rag_tool():
     try:
         from kno.rag_connector import search_knowledge_base as _rag_search
 
-        def search_knowledge_base(query: str) -> dict:
-            """Search the company knowledge base (Confluence + Drive documents) for information.
+        def search_knowledge_base(query: str, days_ago: int = None,
+                                   author: str = None,
+                                   source_type: str = None) -> dict:
+            """Search the company knowledge base for information using semantic similarity.
 
             Use this FIRST for any question about company processes, policies, how-tos,
             product specs, or internal documentation. Returns passages with source citations.
 
             Args:
                 query: Natural language search query, e.g. 'onboarding process for engineers'
+                days_ago: Only return docs modified/ingested within the last N days
+                author: Filter by document author/contributor name
+                source_type: Limit to one source — 'confluence', 'github', 'drive', etc.
             """
-            results = _rag_search(query, top_k=5)
+            results = _rag_search(query, top_k=5,
+                                  days_ago=days_ago, author=author, source_type=source_type)
             if not results:
                 return {"status": "no_results", "message": f"No knowledge base articles found for: {query}"}
             return {
