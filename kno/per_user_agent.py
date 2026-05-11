@@ -90,11 +90,12 @@ Help employees find information from their connected tools quickly and accuratel
 - For documents/knowledge base: use search_knowledge_base first.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
-- For team chat: use search_slack_messages.
-  * "What's been discussed in Slack?" → call search_slack_messages(query="")  ← do this immediately, no clarifying question
-  * "What's been discussed in #general?" → call search_slack_messages(query="")  ← same, read the channel directly
+- For team chat:
+  * "What's been discussed in Slack?" → call get_slack_activity()  ← no parameters, call immediately
+  * "What's happening in Slack?" → call get_slack_activity()
+  * "Summarise #general" → call get_slack_activity()
   * "Search Slack for budget" → call search_slack_messages(query="budget")
-  RULE: NEVER say "I need a keyword to search Slack." NEVER ask the user for a topic before calling the tool. If no keyword is given, call with query="" and summarise what you find.
+  RULE: For any open-ended Slack question, call get_slack_activity() immediately — zero parameters, no clarifying question needed.
 - For tasks/bugs: use search_jira_issues.
 - For code/PRs: use list_github_repos, search_github_issues, or get_github_pull_requests.
 - For CRM: use search_zoho_contacts or search_zoho_deals.
@@ -245,127 +246,94 @@ def _make_slack_tools(email: str):
 
     creds_data = get_app_credentials(email, "slack")
 
-    def search_slack_messages(query: str = "", count: int = 10) -> dict:
-        """Search Slack messages or browse recent activity.
+    def get_slack_activity() -> dict:
+        """Return recent messages from the most active Slack channels.
 
-        - Pass a keyword/phrase to search the full message history (e.g. 'budget approval').
-        - Pass an EMPTY STRING "" (or omit query) to get the most recent messages from the
-          top channels — use this for "what's been discussed?", "any recent updates?", or
-          "what's happening in Slack?" type questions. NEVER ask the user for a keyword
-          when they want to browse recent activity — just call this with query="".
-
-        Args:
-            query: Keyword to search for. Pass "" to get recent messages without a keyword.
-            count: Max results (default 10)
+        Call this for ANY question about recent Slack activity, e.g.:
+        "What has been discussed in Slack?", "What's happening in Slack?",
+        "Any recent updates?", "Summarise Slack", "What's been said in #general?"
+        No parameters needed — just call it immediately.
         """
         if not creds_data:
             return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
-
-        user_token = creds_data.get("user_token", "")
-        bot_token  = creds_data.get("bot_token", "")
-        token = user_token or bot_token
-        if not token:
-            return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
-
-        cli = WebClient(token=token)
-
-        # ── No keyword: browse recent channel history ─────────────────────────
-        if not query.strip():
-            try:
-                # Try public + private; fall back to public-only if groups:read missing
-                try:
-                    ch_resp = cli.conversations_list(
-                        types="public_channel,private_channel",
-                        limit=200,
-                        exclude_archived=True,
-                    )
-                except SlackApiError:
-                    ch_resp = cli.conversations_list(
-                        types="public_channel",
-                        limit=200,
-                        exclude_archived=True,
-                    )
-                all_channels = ch_resp.get("channels", [])
-                all_channels.sort(key=lambda c: c.get("num_members", 0), reverse=True)
-                top_channels = all_channels[:5]  # top 5 most-active channels
-
-                results = []
-                for ch in top_channels:
-                    try:
-                        hist = cli.conversations_history(channel=ch["id"], limit=8)
-                        for msg in hist.get("messages", []):
-                            text = msg.get("text", "").strip()
-                            if not text or msg.get("subtype"):
-                                continue
-                            ts_raw = msg.get("ts", "")
-                            permalink = (
-                                f"https://slack.com/archives/{ch['id']}/p{ts_raw.replace('.', '')}"
-                                if ts_raw else ""
-                            )
-                            results.append({
-                                "channel": ch.get("name", "unknown"),
-                                "author": msg.get("user", msg.get("username", "unknown")),
-                                "text": text[:400],
-                                "timestamp": ts_raw,
-                                "permalink": permalink,
-                            })
-                    except SlackApiError:
-                        continue
-                if not results:
-                    return {"status": "no_results", "message": "No recent Slack messages found."}
-                return {"status": "success", "mode": "recent", "count": len(results), "messages": results}
-            except Exception as e:
-                return {"status": "error", "message": str(e)}
-
-        # ── Keyword search via Slack Search API ───────────────────────────────
         try:
+            token = creds_data.get("user_token") or creds_data.get("bot_token", "")
+            if not token:
+                return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
+            cli = WebClient(token=token)
+            try:
+                ch_resp = cli.conversations_list(
+                    types="public_channel,private_channel", limit=200, exclude_archived=True)
+            except SlackApiError:
+                ch_resp = cli.conversations_list(
+                    types="public_channel", limit=200, exclude_archived=True)
+
+            all_channels = ch_resp.get("channels", [])
+            all_channels.sort(key=lambda c: c.get("num_members", 0), reverse=True)
+
+            results = []
+            for ch in all_channels[:6]:
+                try:
+                    hist = cli.conversations_history(channel=ch["id"], limit=10)
+                    for msg in hist.get("messages", []):
+                        text = msg.get("text", "").strip()
+                        if not text or msg.get("subtype"):
+                            continue
+                        ts_raw = msg.get("ts", "")
+                        results.append({
+                            "channel": ch.get("name", "unknown"),
+                            "author": msg.get("user", msg.get("username", "unknown")),
+                            "text": text[:400],
+                            "timestamp": ts_raw,
+                            "permalink": f"https://slack.com/archives/{ch['id']}/p{ts_raw.replace('.','')}" if ts_raw else "",
+                        })
+                except SlackApiError:
+                    continue
+
+            if not results:
+                return {"status": "no_results", "message": "No recent Slack messages found."}
+            return {"status": "success", "count": len(results), "messages": results}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def search_slack_messages(query: str, count: int = 10) -> dict:
+        """Search Slack for messages containing a specific keyword or phrase.
+
+        Use this ONLY when the user names a specific topic to look for,
+        e.g. "search Slack for budget approval" or "find Slack messages about the outage".
+        For general recent activity use get_slack_activity instead.
+
+        Args:
+            query: Keyword or phrase to search for (required)
+            count: Max messages to return (default 10)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
+        try:
+            token = creds_data.get("user_token") or creds_data.get("bot_token", "")
+            if not token:
+                return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
+            cli = WebClient(token=token)
             resp = cli.search_messages(query=query, count=count, sort="timestamp", sort_dir="desc")
             matches = resp.get("messages", {}).get("matches", [])
             if not matches:
                 return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
-            results = []
-            for m in matches:
-                results.append({
+            return {"status": "success", "count": len(matches), "messages": [
+                {
                     "channel": m.get("channel", {}).get("name", "unknown"),
                     "author": m.get("username", m.get("user", "unknown")),
                     "text": m.get("text", "")[:400],
                     "timestamp": m.get("ts", ""),
                     "permalink": m.get("permalink", ""),
-                })
-            return {"status": "success", "mode": "search", "count": len(results), "messages": results}
+                }
+                for m in matches
+            ]}
         except SlackApiError as e:
-            # search:read scope missing — fall back to channel scan with keyword filter
-            if "missing_scope" in str(e) or "not_allowed_token_type" in str(e):
-                try:
-                    cli2 = WebClient(token=bot_token or token)
-                    channels = cli2.conversations_list(types="public_channel", limit=50).get("channels", [])
-                    results = []
-                    for ch in channels:
-                        try:
-                            history = cli2.conversations_history(channel=ch["id"], limit=30)
-                            for msg in history.get("messages", []):
-                                text = msg.get("text", "")
-                                if query.lower() in text.lower():
-                                    results.append({
-                                        "channel": ch["name"],
-                                        "text": text[:400],
-                                        "timestamp": msg.get("ts", ""),
-                                        "permalink": "",
-                                    })
-                        except SlackApiError:
-                            continue
-                    return (
-                        {"status": "success", "mode": "scan", "count": len(results), "messages": results}
-                        if results else
-                        {"status": "no_results", "message": f"No Slack messages found for: {query}"}
-                    )
-                except Exception as e2:
-                    return {"status": "error", "message": str(e2)}
             return {"status": "error", "message": str(e)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [search_slack_messages]
+    return [get_slack_activity, search_slack_messages]
 
 
 def _make_github_tools(email: str):
