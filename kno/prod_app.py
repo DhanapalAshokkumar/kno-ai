@@ -405,6 +405,19 @@ def kb_stats(email: str = Depends(current_user)):
     return get_corpus_stats()
 
 
+@app.post("/admin/kb/backfill")
+def kb_backfill(email: str = Depends(current_user)):
+    """Generate text-embedding-004 vectors for any KB docs that lack one.
+
+    Safe to call multiple times — already-embedded docs are skipped.
+    Run this once after deploying the semantic-search upgrade.
+    """
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admin only")
+    from kno.rag_connector import backfill_embeddings
+    return backfill_embeddings()
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
