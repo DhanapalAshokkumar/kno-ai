@@ -96,13 +96,35 @@ def sources_from_drive(files: list[dict]) -> list[dict]:
         {
             "source": "Google Drive",
             "title": f.get("name", "Untitled"),
-            "url": f.get("url", ""),
+            "url": f.get("url", f.get("webViewLink", "")),
             "author": f.get("owner", ""),
-            "date": f.get("modified", ""),
-            "text": "",
+            "date": f.get("modified", f.get("modifiedTime", "")),
+            "text": f.get("snippet", ""),
         }
         for f in (files or [])
     ]
+
+
+def sources_from_slack(messages: list[dict]) -> list[dict]:
+    """Convert Slack search results to citation sources."""
+    from datetime import datetime
+    results = []
+    for m in (messages or []):
+        ts = m.get("timestamp", "")
+        # Convert Slack epoch timestamp to a readable date
+        try:
+            date_str = datetime.fromtimestamp(float(ts)).strftime("%b %d, %Y")
+        except Exception:
+            date_str = ts
+        results.append({
+            "source": "Slack",
+            "title": f"#{m.get('channel', 'unknown')} — {m.get('text', '')[:60]}",
+            "url": m.get("permalink", ""),
+            "author": m.get("author", m.get("user", "")),
+            "date": date_str,
+            "text": m.get("text", "")[:200],
+        })
+    return results
 
 
 def sources_from_confluence(pages: list[dict]) -> list[dict]:

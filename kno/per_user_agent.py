@@ -78,6 +78,8 @@ Help employees find information from their connected tools quickly and accuratel
   [3] Confluence: Page Title — Space: ENG | Updated: May 1, 2026 | [link](url)
   [4] Jira: KEY-123 — Summary of issue | Status: In Progress | [link](url)
   [5] GitHub: #42 PR Title — Repo: owner/repo | Author: username | [link](url)
+  [6] Slack: #channel-name — snippet of message | Author: username | Date: May 8, 2026 | [link](url)
+  [7] Google Drive: Document Title — Owner: name | Updated: May 1, 2026 | [link](url)
 
 - Keep source lines SHORT and human-readable. Never paste raw JSON or full email bodies.
 - If no source found: write *No source found.*
@@ -196,11 +198,36 @@ def _make_drive_tool(email: str):
             files = resp.get("files", [])
             if not files:
                 return {"status": "no_results", "message": f"No files found for: {query}"}
-            return {"status": "success", "count": len(files), "files": [
-                {"id": f["id"], "name": f.get("name"),
-                 "modified": f.get("modifiedTime"), "url": f.get("webViewLink")}
-                for f in files
-            ]}
+
+            results = []
+            for f in files:
+                file_entry = {
+                    "id": f["id"],
+                    "name": f.get("name"),
+                    "modified": f.get("modifiedTime"),
+                    "url": f.get("webViewLink"),
+                    "owner": (f.get("owners") or [{}])[0].get("displayName", ""),
+                    "snippet": "",
+                }
+                # Try to export a plain-text snippet for Docs/Sheets/Slides
+                mime = f.get("mimeType", "")
+                if "google-apps.document" in mime or "google-apps.presentation" in mime or "google-apps.spreadsheet" in mime:
+                    try:
+                        export_resp = svc.files().export(
+                            fileId=f["id"], mimeType="text/plain"
+                        ).execute()
+                        if isinstance(export_resp, bytes):
+                            text = export_resp.decode("utf-8", errors="replace")
+                        else:
+                            text = str(export_resp)
+                        import re as _re
+                        text = _re.sub(r"\s+", " ", text).strip()
+                        file_entry["snippet"] = text[:400]
+                    except Exception:
+                        pass
+                results.append(file_entry)
+
+            return {"status": "success", "count": len(results), "files": results}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
@@ -213,26 +240,59 @@ def _make_slack_tools(email: str):
 
     creds_data = get_app_credentials(email, "slack")
 
-    def _client():
-        token = creds_data["bot_token"] if creds_data else ""
-        return WebClient(token=token)
+    def search_slack_messages(query: str, count: int = 10) -> dict:
+        """Search all Slack messages and channels for a keyword using full-text search.
 
-    def search_slack_messages(query: str, limit: int = 30) -> dict:
-        """Search recent Slack messages by keyword.
+        Uses the Slack Search API — no need for the bot to be invited to channels.
+        Returns matching messages with channel name, author, and timestamp.
 
         Args:
-            query: Keyword to search for
-            limit: Max messages to scan (default 30)
+            query: Keyword or phrase to search for, e.g. 'deployment issue' or 'budget approval'
+            count: Max messages to return (default 10)
         """
         if not creds_data:
             return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
         try:
-            cli = _client()
-            channels = cli.conversations_list(types="public_channel", limit=100).get("channels", [])
+            # Prefer user token (has search:read scope) over bot token
+            user_token = creds_data.get("user_token", "")
+            bot_token  = creds_data.get("bot_token", "")
+            token = user_token or bot_token
+            if not token:
+                return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
+
+            cli = WebClient(token=token)
+            resp = cli.search_messages(query=query, count=count, sort="timestamp", sort_dir="desc")
+            matches = resp.get("messages", {}).get("matches", [])
+            if not matches:
+                return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
+
+            results = []
+            for m in matches:
+                results.append({
+                    "channel": m.get("channel", {}).get("name", "unknown"),
+                    "author": m.get("username", m.get("user", "unknown")),
+                    "text": m.get("text", "")[:400],
+                    "timestamp": m.get("ts", ""),
+                    "permalink": m.get("permalink", ""),
+                })
+            return {"status": "success", "count": len(results), "messages": results}
+        except SlackApiError as e:
+            # Fall back to bot-token channel scan if search:read not granted
+            if "missing_scope" in str(e) or "not_allowed_token_type" in str(e):
+                return _fallback_slack_scan(creds_data, query)
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def _fallback_slack_scan(creds_data: dict, query: str) -> dict:
+        """Fallback: manually scan public channels the bot is in."""
+        try:
+            cli = WebClient(token=creds_data.get("bot_token", ""))
+            channels = cli.conversations_list(types="public_channel", limit=50).get("channels", [])
             results = []
             for ch in channels:
                 try:
-                    history = cli.conversations_history(channel=ch["id"], limit=limit)
+                    history = cli.conversations_history(channel=ch["id"], limit=30)
                     for msg in history.get("messages", []):
                         text = msg.get("text", "")
                         if query.lower() in text.lower():
@@ -240,6 +300,7 @@ def _make_slack_tools(email: str):
                                 "channel": ch["name"],
                                 "text": text[:400],
                                 "timestamp": msg.get("ts", ""),
+                                "permalink": "",
                             })
                 except SlackApiError:
                     continue

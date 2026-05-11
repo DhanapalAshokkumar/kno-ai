@@ -19,6 +19,7 @@ from kno.auth import get_current_user
 from kno.user_store import (
     get_or_create_user,
     get_connected_apps,
+    get_app_credentials,
     store_app_credentials,
     disconnect_app,
 )
@@ -201,6 +202,7 @@ def auth_slack_callback(code: str, state: str):
 
     store_app_credentials(email, "slack", {
         "bot_token": data["access_token"],
+        "user_token": data.get("authed_user", {}).get("access_token", ""),
         "team_id": data.get("team", {}).get("id", ""),
         "team_name": data.get("team", {}).get("name", ""),
     })
@@ -284,12 +286,11 @@ def disconnect(app_name: str, email: str = Depends(current_user)):
 
 @app.post("/admin/ingest/confluence")
 async def ingest_confluence(email: str = Depends(current_user)):
-    """Ingest all Confluence pages into the RAG knowledge base corpus."""
-    if email not in {"dhana19.ece@gmail.com"}:
+    """Ingest all Confluence pages into the RAG knowledge base (synchronous)."""
+    if email not in ADMIN_EMAILS:
         raise HTTPException(status_code=403, detail="Admin only")
 
     import re
-    import requests as req
     from kno.rag_connector import ingest_text
 
     creds = get_app_credentials(email, "jira")
@@ -297,52 +298,54 @@ async def ingest_confluence(email: str = Depends(current_user)):
         raise HTTPException(status_code=400, detail="Jira/Confluence not connected")
 
     auth = (creds["email"], creds["api_token"])
-    site  = creds["site"]
-    base  = f"https://{site}"
+    base = f"https://{creds['site']}"
 
-    # List all Confluence spaces
-    spaces_r = req.get(f"{base}/wiki/rest/api/space", auth=auth, params={"limit": 50})
+    spaces_r = req.get(f"{base}/wiki/rest/api/space", auth=auth,
+                       params={"limit": 50}, timeout=15)
     spaces = spaces_r.json().get("results", []) if spaces_r.ok else []
 
-    ingested, failed = 0, 0
+    ingested, failed, errors = 0, 0, []
     for space in spaces:
         key = space["key"]
-        # Get pages in this space
         pages_r = req.get(
-            f"{base}/wiki/rest/api/content",
-            auth=auth,
+            f"{base}/wiki/rest/api/content", auth=auth, timeout=15,
             params={"spaceKey": key, "type": "page", "limit": 50,
                     "expand": "body.storage,version,history.lastUpdated"},
         )
         if not pages_r.ok:
             continue
         for page in pages_r.json().get("results", []):
-            title   = page.get("title", "")
-            page_id = page["id"]
-            url     = f"{base}/wiki{page.get('_links',{}).get('webui','')}"
-            updated = page.get("version", {}).get("when", "")[:10]
-            author  = page.get("history", {}).get("lastUpdated", {}).get("by", {}).get("displayName", "")
-
-            # Strip HTML from storage format
+            title    = page.get("title", "")
+            url      = f"{base}/wiki{page.get('_links', {}).get('webui', '')}"
+            updated  = page.get("version", {}).get("when", "")[:10]
+            author   = page.get("history", {}).get("lastUpdated", {}).get("by", {}).get("displayName", "")
             raw_html = page.get("body", {}).get("storage", {}).get("value", "")
             text = re.sub(r"<[^>]+>", " ", raw_html)
             text = re.sub(r"\s+", " ", text).strip()
-
             if not text:
                 continue
-
-            ok = ingest_text(
-                text=text, display_name=title,
-                source="confluence", url=url,
-                author=author, modified_date=updated,
-            )
-            if ok:
-                ingested += 1
-            else:
+            try:
+                ok = ingest_text(
+                    text=text, display_name=title,
+                    source="confluence", url=url,
+                    author=author, modified_date=updated,
+                )
+                if ok:
+                    ingested += 1
+                else:
+                    failed += 1
+                    errors.append(f"upload failed: {title}")
+            except Exception as e:
                 failed += 1
+                errors.append(f"{title}: {str(e)[:100]}")
 
-    return {"status": "done", "ingested": ingested, "failed": failed,
-            "spaces": len(spaces)}
+    return {
+        "status": "done",
+        "ingested": ingested,
+        "failed": failed,
+        "spaces": len(spaces),
+        "errors": errors[:5],   # first 5 errors for diagnosis
+    }
 
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
@@ -390,6 +393,16 @@ tr:not(:last-child){{border-bottom:1px solid #2e2e3a}}
 <tbody>{rows}</tbody></table>
 <p style="margin-top:16px;font-size:12px;color:#444">Logged in as {email} · <a href="/" style="color:#6c63ff">← Back to kno</a></p>
 </body></html>""")
+
+
+# ── KB stats ─────────────────────────────────────────────────────────────────
+
+@app.get("/admin/kb/stats")
+def kb_stats(email: str = Depends(current_user)):
+    if email not in ADMIN_EMAILS:
+        raise HTTPException(status_code=403, detail="Admin only")
+    from kno.rag_connector import get_corpus_stats
+    return get_corpus_stats()
 
 
 # ── Chat ──────────────────────────────────────────────────────────────────────
