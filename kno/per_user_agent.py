@@ -261,6 +261,23 @@ def _make_slack_tools(email: str):
             if not token:
                 return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
             cli = WebClient(token=token)
+
+            # Cache user ID → display name lookups
+            _user_cache: dict = {}
+            def _resolve_user(uid: str) -> str:
+                if not uid or uid.startswith("B"):  # skip bot IDs
+                    return uid
+                if uid in _user_cache:
+                    return _user_cache[uid]
+                try:
+                    info = cli.users_info(user=uid)
+                    name = (info.get("user") or {}).get("real_name") or \
+                           (info.get("user") or {}).get("name") or uid
+                    _user_cache[uid] = name
+                    return name
+                except Exception:
+                    return uid
+
             try:
                 ch_resp = cli.conversations_list(
                     types="public_channel,private_channel", limit=200, exclude_archived=True)
@@ -280,9 +297,10 @@ def _make_slack_tools(email: str):
                         if not text or msg.get("subtype"):
                             continue
                         ts_raw = msg.get("ts", "")
+                        uid = msg.get("user", msg.get("username", ""))
                         results.append({
                             "channel": ch.get("name", "unknown"),
-                            "author": msg.get("user", msg.get("username", "unknown")),
+                            "author": _resolve_user(uid) if uid else "unknown",
                             "text": text[:400],
                             "timestamp": ts_raw,
                             "permalink": f"https://slack.com/archives/{ch['id']}/p{ts_raw.replace('.','')}" if ts_raw else "",
@@ -318,10 +336,26 @@ def _make_slack_tools(email: str):
             matches = resp.get("messages", {}).get("matches", [])
             if not matches:
                 return {"status": "no_results", "message": f"No Slack messages found for: {query}"}
+            # Resolve user IDs to display names
+            _user_cache: dict = {}
+            def _resolve(uid: str) -> str:
+                if not uid:
+                    return "unknown"
+                if uid in _user_cache:
+                    return _user_cache[uid]
+                try:
+                    info = cli.users_info(user=uid)
+                    name = (info.get("user") or {}).get("real_name") or \
+                           (info.get("user") or {}).get("name") or uid
+                    _user_cache[uid] = name
+                    return name
+                except Exception:
+                    return uid
+
             return {"status": "success", "count": len(matches), "messages": [
                 {
                     "channel": m.get("channel", {}).get("name", "unknown"),
-                    "author": m.get("username", m.get("user", "unknown")),
+                    "author": _resolve(m.get("user", m.get("username", ""))),
                     "text": m.get("text", "")[:400],
                     "timestamp": m.get("ts", ""),
                     "permalink": m.get("permalink", ""),
