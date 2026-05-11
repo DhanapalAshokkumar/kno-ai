@@ -264,13 +264,33 @@ def connect_zoho(body: ZohoConnectRequest, email: str = Depends(current_user)):
     if "access_token" not in data:
         raise HTTPException(status_code=400, detail=f"Invalid Zoho credentials: {data.get('error', data)}")
 
+    access_token = data["access_token"]
+    # Zoho returns the correct API domain in the token response
+    api_domain_crm = data.get("api_domain", "https://www.zohoapis.in")
+
+    # Fetch org ID once at connect time — stored in creds so runtime needs no extra call
+    org_id = ""
+    try:
+        org_resp = req.get(
+            f"{api_domain_crm}/crm/v2/org",
+            headers={"Authorization": f"Zoho-oauthtoken {access_token}"},
+            timeout=10,
+        )
+        if org_resp.ok:
+            orgs = org_resp.json().get("org", [{}])
+            org_id = str(orgs[0].get("zgid", "")) if orgs else ""
+    except Exception:
+        pass  # org_id stays ""
+
     store_app_credentials(email, "zoho", {
-        "client_id": body.client_id,
-        "client_secret": body.client_secret,
-        "refresh_token": body.refresh_token,
-        "api_domain": body.api_domain,
+        "client_id":      body.client_id,
+        "client_secret":  body.client_secret,
+        "refresh_token":  body.refresh_token,
+        "api_domain":     body.api_domain,
+        "api_domain_crm": api_domain_crm,   # e.g. https://www.zohoapis.in
+        "org_id":         org_id,            # e.g. "738xxxx" for deep links
     })
-    return {"status": "connected", "app": "zoho"}
+    return {"status": "connected", "app": "zoho", "org_id": org_id or "unknown"}
 
 
 # ── Disconnect ─────────────────────────────────────────────────────────────────

@@ -775,16 +775,22 @@ def _make_zoho_tools(email: str):
     def _refresh():
         if not creds_data:
             return ""
+        # Use stored accounts domain (default zoho.in); handles .com, .eu, etc.
+        accts_domain = creds_data.get("api_domain", "https://accounts.zoho.in")
         r = req.post(
-            "https://accounts.zoho.in/oauth/v2/token",
+            f"{accts_domain}/oauth/v2/token",
             data={
                 "refresh_token": creds_data["refresh_token"],
-                "client_id": creds_data["client_id"],
+                "client_id":     creds_data["client_id"],
                 "client_secret": creds_data["client_secret"],
-                "grant_type": "refresh_token",
+                "grant_type":    "refresh_token",
             },
         )
         token = r.json().get("access_token", "")
+        if not token:
+            import logging as _log
+            _log.getLogger(__name__).error(
+                "Zoho token refresh failed: %s", r.text[:200])
         _token_store["access_token"] = token
         return token
 
@@ -800,37 +806,22 @@ def _make_zoho_tools(email: str):
             resp = req.get(url, headers=_headers(), params=params)
         return resp
 
-    BASE     = "https://www.zohoapis.in/crm/v2"
-    BASE_URL = "https://crm.zoho.in/crm"
-
-    # Org ID is needed for deep links — fetch once and cache in this closure
-    _org_cache: dict = {"id": None}
-
-    def _zoho_org_id() -> str:
-        if _org_cache["id"]:
-            return _org_cache["id"]
-        try:
-            r = _get(f"{BASE}/org")
-            if r.ok:
-                orgs = r.json().get("org", [{}])
-                zgid = str(orgs[0].get("zgid", "")) if orgs else ""
-                _org_cache["id"] = zgid
-                return zgid
-        except Exception:
-            pass
-        return ""
+    # Use API domain from stored creds (set at connect-time); fall back to .in
+    _api_crm  = (creds_data or {}).get("api_domain_crm", "https://www.zohoapis.in")
+    BASE      = f"{_api_crm}/crm/v2"
+    # Org ID stored at connect-time — used to build deep links without extra API calls
+    _org_id   = (creds_data or {}).get("org_id", "")
+    _web_base = _api_crm.replace("www.zohoapis", "crm.zoho").replace("/crm/v2", "")
 
     def _deal_url(deal_id: str) -> str:
-        oid = _zoho_org_id()
-        if oid:
-            return f"{BASE_URL}/org{oid}/tab/Potentials/{deal_id}"
-        return f"{BASE_URL}/tab/Potentials/{deal_id}"
+        if _org_id:
+            return f"{_web_base}/crm/org{_org_id}/tab/Potentials/{deal_id}"
+        return f"{_web_base}/crm/tab/Potentials/{deal_id}"
 
     def _contact_url(contact_id: str) -> str:
-        oid = _zoho_org_id()
-        if oid:
-            return f"{BASE_URL}/org{oid}/tab/Contacts/{contact_id}"
-        return f"{BASE_URL}/tab/Contacts/{contact_id}"
+        if _org_id:
+            return f"{_web_base}/crm/org{_org_id}/tab/Contacts/{contact_id}"
+        return f"{_web_base}/crm/tab/Contacts/{contact_id}"
 
     def search_zoho_contacts(query: str) -> dict:
         """Search Zoho CRM contacts by name or email.
@@ -884,7 +875,7 @@ def _make_zoho_tools(email: str):
             if resp.status_code == 204:
                 return {"status": "no_results", "message": f"No deals found" + (f" in stage: {stage}" if stage else "")}
             if not resp.ok:
-                return {"status": "error", "message": resp.text}
+                return {"status": "error", "message": f"Zoho API error {resp.status_code}: {resp.text[:300]}"}
 
             ts_cutoff = _cutoff_dt(days_ago)
             deals = []
