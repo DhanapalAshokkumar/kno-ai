@@ -99,7 +99,7 @@ Help employees find information from their connected tools quickly and accuratel
 
   **Sources**
   [1] Gmail: Subject of email — From: sender@example.com | Date: May 8, 2026
-  [2] Zoho CRM: Deal Name — Stage: Negotiation | Amount: $70,000 | Closing: Apr 29
+  [2] Zoho CRM: Deal Name — Stage: Negotiation | Amount: $70,000 | Closing: Apr 29 | [link](url)
   [3] Confluence: Page Title — Space: ENG | Updated: May 1, 2026 | [link](url)
   [4] Jira: KEY-123 — Summary of issue | Status: In Progress | [link](url)
   [5] GitHub: owner/repo-name — Description of repo | Updated: May 8, 2026 | [link](url)
@@ -800,7 +800,37 @@ def _make_zoho_tools(email: str):
             resp = req.get(url, headers=_headers(), params=params)
         return resp
 
-    BASE = "https://www.zohoapis.in/crm/v2"
+    BASE     = "https://www.zohoapis.in/crm/v2"
+    BASE_URL = "https://crm.zoho.in/crm"
+
+    # Org ID is needed for deep links — fetch once and cache in this closure
+    _org_cache: dict = {"id": None}
+
+    def _zoho_org_id() -> str:
+        if _org_cache["id"]:
+            return _org_cache["id"]
+        try:
+            r = _get(f"{BASE}/org")
+            if r.ok:
+                orgs = r.json().get("org", [{}])
+                zgid = str(orgs[0].get("zgid", "")) if orgs else ""
+                _org_cache["id"] = zgid
+                return zgid
+        except Exception:
+            pass
+        return ""
+
+    def _deal_url(deal_id: str) -> str:
+        oid = _zoho_org_id()
+        if oid:
+            return f"{BASE_URL}/org{oid}/tab/Potentials/{deal_id}"
+        return f"{BASE_URL}/tab/Potentials/{deal_id}"
+
+    def _contact_url(contact_id: str) -> str:
+        oid = _zoho_org_id()
+        if oid:
+            return f"{BASE_URL}/org{oid}/tab/Contacts/{contact_id}"
+        return f"{BASE_URL}/tab/Contacts/{contact_id}"
 
     def search_zoho_contacts(query: str) -> dict:
         """Search Zoho CRM contacts by name or email.
@@ -818,9 +848,14 @@ def _make_zoho_tools(email: str):
             if not resp.ok:
                 return {"status": "error", "message": resp.text}
             contacts = [
-                {"id": c.get("id"), "first_name": c.get("First_Name", ""),
-                 "last_name": c.get("Last_Name", ""), "email": c.get("Email", ""),
-                 "phone": c.get("Phone", "")}
+                {
+                    "id":         c.get("id"),
+                    "first_name": c.get("First_Name", ""),
+                    "last_name":  c.get("Last_Name", ""),
+                    "email":      c.get("Email", ""),
+                    "phone":      c.get("Phone", ""),
+                    "url":        _contact_url(c.get("id", "")),
+                }
                 for c in resp.json().get("data", [])
             ]
             return {"status": "success", "count": len(contacts), "contacts": contacts}
@@ -868,12 +903,13 @@ def _make_zoho_tools(email: str):
                 if owner and owner.lower() not in deal_owner.lower():
                     continue
                 deals.append({
-                    "id": d.get("id"),
-                    "deal_name": d.get("Deal_Name", ""),
-                    "amount": d.get("Amount"),
-                    "stage": d.get("Stage", ""),
+                    "id":           d.get("id"),
+                    "deal_name":    d.get("Deal_Name", ""),
+                    "amount":       d.get("Amount"),
+                    "stage":        d.get("Stage", ""),
                     "closing_date": d.get("Closing_Date", ""),
-                    "owner": deal_owner,
+                    "owner":        deal_owner,
+                    "url":          _deal_url(d.get("id", "")),
                 })
             if not deals:
                 return {"status": "no_results", "message": "No deals matched the filters."}
