@@ -77,11 +77,13 @@ Help employees find information from their connected tools quickly and accuratel
   [2] Zoho CRM: Deal Name — Stage: Negotiation | Amount: $70,000 | Closing: Apr 29
   [3] Confluence: Page Title — Space: ENG | Updated: May 1, 2026 | [link](url)
   [4] Jira: KEY-123 — Summary of issue | Status: In Progress | [link](url)
-  [5] GitHub: #42 PR Title — Repo: owner/repo | Author: username | [link](url)
+  [5] GitHub: owner/repo-name — Description of repo | Updated: May 8, 2026 | [link](url)
   [6] Slack: #channel-name — snippet of message | Author: username | Date: May 8, 2026 | [link](url)
   [7] Google Drive: Document Title — Owner: name | Updated: May 1, 2026 | [link](url)
 
 - Keep source lines SHORT and human-readable. Never paste raw JSON or full email bodies.
+- For GitHub repos: assign a SEPARATE citation number [N] to EACH repository — never group multiple repos under one [1].
+- For Slack: always try get_recent_slack_messages first if no keyword is given; use search_slack_messages when user specifies a topic.
 - If no source found: write *No source found.*
 
 ## Search strategy
@@ -89,9 +91,9 @@ Help employees find information from their connected tools quickly and accuratel
 - For documents/knowledge base: use search_knowledge_base first.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
-- For team chat: use search_slack_messages.
+- For team chat: use search_slack_messages (with keyword). For recent activity without a keyword, use get_recent_slack_messages.
 - For tasks/bugs: use search_jira_issues.
-- For code/PRs: use search_github_issues or get_github_pull_requests.
+- For code/PRs: use list_github_repos, search_github_issues, or get_github_pull_requests.
 - For CRM: use search_zoho_contacts or search_zoho_deals.
 
 ## Formatting
@@ -284,6 +286,71 @@ def _make_slack_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    def get_recent_slack_messages(channels: int = 5, messages_per_channel: int = 8) -> dict:
+        """Fetch the most recent messages from Slack without needing a keyword.
+
+        Use this when the user asks "what's happening in Slack?", "any recent updates?",
+        or "what has the team been discussing?" — i.e. browsing without a specific topic.
+
+        Args:
+            channels: Number of most-active public channels to check (default 5)
+            messages_per_channel: Messages per channel (default 8)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Slack not connected — go to Settings to connect Slack."}
+        try:
+            # Prefer user token, fall back to bot token
+            user_token = creds_data.get("user_token", "")
+            bot_token  = creds_data.get("bot_token", "")
+            token = user_token or bot_token
+            if not token:
+                return {"status": "error", "message": "Slack token missing — reconnect Slack in Settings."}
+
+            cli = WebClient(token=token)
+            # List public channels sorted by member count (most active first)
+            ch_resp = cli.conversations_list(
+                types="public_channel,private_channel",
+                limit=200,
+                exclude_archived=True,
+            )
+            all_channels = ch_resp.get("channels", [])
+            # Sort by member count descending, take top N
+            all_channels.sort(key=lambda c: c.get("num_members", 0), reverse=True)
+            top_channels = all_channels[:channels]
+
+            results = []
+            for ch in top_channels:
+                try:
+                    hist = cli.conversations_history(channel=ch["id"], limit=messages_per_channel)
+                    for msg in hist.get("messages", []):
+                        text = msg.get("text", "").strip()
+                        if not text or msg.get("subtype"):  # skip system messages
+                            continue
+                        # Build permalink if possible
+                        team_id = creds_data.get("team_id", "")
+                        ts_raw  = msg.get("ts", "")
+                        permalink = (
+                            f"https://slack.com/archives/{ch['id']}/p{ts_raw.replace('.', '')}"
+                            if ts_raw else ""
+                        )
+                        results.append({
+                            "channel": ch.get("name", "unknown"),
+                            "author": msg.get("user", msg.get("username", "unknown")),
+                            "text": text[:400],
+                            "timestamp": ts_raw,
+                            "permalink": permalink,
+                        })
+                except SlackApiError:
+                    continue  # skip channels the token can't access
+
+            if not results:
+                return {"status": "no_results", "message": "No recent Slack messages found."}
+            return {"status": "success", "count": len(results), "messages": results}
+        except SlackApiError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
     def _fallback_slack_scan(creds_data: dict, query: str) -> dict:
         """Fallback: manually scan public channels the bot is in."""
         try:
@@ -309,7 +376,7 @@ def _make_slack_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [search_slack_messages]
+    return [search_slack_messages, get_recent_slack_messages]
 
 
 def _make_github_tools(email: str):
