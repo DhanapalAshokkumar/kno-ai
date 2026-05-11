@@ -90,7 +90,11 @@ Help employees find information from their connected tools quickly and accuratel
 - For documents/knowledge base: use search_knowledge_base first.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
-- For team chat: use search_slack_messages. Pass query="" to browse recent messages without a keyword — NEVER ask the user to provide a keyword just to look at Slack.
+- For team chat: use search_slack_messages.
+  * "What's been discussed in Slack?" → call search_slack_messages(query="")  ← do this immediately, no clarifying question
+  * "What's been discussed in #general?" → call search_slack_messages(query="")  ← same, read the channel directly
+  * "Search Slack for budget" → call search_slack_messages(query="budget")
+  RULE: NEVER say "I need a keyword to search Slack." NEVER ask the user for a topic before calling the tool. If no keyword is given, call with query="" and summarise what you find.
 - For tasks/bugs: use search_jira_issues.
 - For code/PRs: use list_github_repos, search_github_issues, or get_github_pull_requests.
 - For CRM: use search_zoho_contacts or search_zoho_deals.
@@ -268,11 +272,19 @@ def _make_slack_tools(email: str):
         # ── No keyword: browse recent channel history ─────────────────────────
         if not query.strip():
             try:
-                ch_resp = cli.conversations_list(
-                    types="public_channel,private_channel",
-                    limit=200,
-                    exclude_archived=True,
-                )
+                # Try public + private; fall back to public-only if groups:read missing
+                try:
+                    ch_resp = cli.conversations_list(
+                        types="public_channel,private_channel",
+                        limit=200,
+                        exclude_archived=True,
+                    )
+                except SlackApiError:
+                    ch_resp = cli.conversations_list(
+                        types="public_channel",
+                        limit=200,
+                        exclude_archived=True,
+                    )
                 all_channels = ch_resp.get("channels", [])
                 all_channels.sort(key=lambda c: c.get("num_members", 0), reverse=True)
                 top_channels = all_channels[:5]  # top 5 most-active channels

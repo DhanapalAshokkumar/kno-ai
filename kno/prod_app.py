@@ -175,8 +175,8 @@ def auth_slack(request: Request, email: str = Depends(current_user)):
     params = {
         "client_id": SLACK_CLIENT_ID,
         "redirect_uri": SLACK_REDIRECT_URI,
-        "scope": "channels:read,channels:history",
-        "user_scope": "search:read,channels:history,channels:read",
+        "scope": "channels:read,channels:history,groups:read,groups:history",
+        "user_scope": "search:read,channels:read,channels:history,groups:read,groups:history",
         "state": state,
     }
     url = "https://slack.com/oauth/v2/authorize?" + urllib.parse.urlencode(params)
