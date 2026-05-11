@@ -82,8 +82,7 @@ Help employees find information from their connected tools quickly and accuratel
   [7] Google Drive: Document Title — Owner: name | Updated: May 1, 2026 | [link](url)
 
 - Keep source lines SHORT and human-readable. Never paste raw JSON or full email bodies.
-- For GitHub repos: assign a SEPARATE citation number [N] to EACH repository — never group multiple repos under one [1].
-- For Slack: always try get_recent_slack_messages first if no keyword is given; use search_slack_messages when user specifies a topic.
+- For GitHub repos: each repo in the list has its OWN "source_number" field — use THAT number as the citation marker. Never reuse the same number for multiple repos.
 - If no source found: write *No source found.*
 
 ## Search strategy
@@ -91,7 +90,7 @@ Help employees find information from their connected tools quickly and accuratel
 - For documents/knowledge base: use search_knowledge_base first.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
-- For team chat: use search_slack_messages (with keyword). For recent activity without a keyword, use get_recent_slack_messages.
+- For team chat: NEVER ask the user for a Slack search keyword. If the user asks about recent Slack activity, discussions, or "what's happening in Slack" WITHOUT specifying a topic, IMMEDIATELY call get_recent_slack_messages() — do not ask for clarification. Only use search_slack_messages when the user explicitly names a topic (e.g. "search Slack for budget").
 - For tasks/bugs: use search_jira_issues.
 - For code/PRs: use list_github_repos, search_github_issues, or get_github_pull_requests.
 - For CRM: use search_zoho_contacts or search_zoho_deals.
@@ -418,8 +417,9 @@ def _make_github_tools(email: str):
         """List all GitHub repositories for the connected owner/org.
 
         Returns:
-            All repos with name, description, and URL. Call this first if you
-            don't know the repo name before searching issues or PRs.
+            All repos with name, description, URL, and source_number.
+            IMPORTANT: cite each repo using its own source_number field as the
+            citation marker [N] — every repo is a distinct source with a unique number.
         """
         if not creds_data:
             return {"status": "error", "message": "GitHub not connected — go to Settings to connect GitHub."}
@@ -434,12 +434,22 @@ def _make_github_tools(email: str):
             repos = r.json() if r.ok else []
             if not repos:
                 return {"status": "no_results", "message": f"No repos found for {owner}"}
-            return {"status": "success", "count": len(repos), "repos": [
-                {"name": rp["name"], "full_name": rp["full_name"],
-                 "description": rp.get("description", ""),
-                 "url": rp["html_url"], "updated": rp.get("updated_at", "")}
-                for rp in repos
-            ]}
+            return {
+                "status": "success",
+                "count": len(repos),
+                "citation_note": "Each repo below has a unique source_number — use it as [N] in citations.",
+                "repos": [
+                    {
+                        "source_number": idx + 1,
+                        "name": rp["name"],
+                        "full_name": rp["full_name"],
+                        "description": rp.get("description", ""),
+                        "url": rp["html_url"],
+                        "updated": rp.get("updated_at", ""),
+                    }
+                    for idx, rp in enumerate(repos)
+                ],
+            }
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
