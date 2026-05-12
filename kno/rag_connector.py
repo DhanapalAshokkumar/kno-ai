@@ -39,8 +39,10 @@ _COLLECTION = "knowledge_base"
 # text-embedding-004 produces 768-dimensional vectors
 _EMBED_MODEL = "text-embedding-004"
 # Cosine similarity threshold below which results are suppressed.
-# 0.45 works well for short Confluence pages; raise to 0.55+ for larger corpora.
-_SIM_THRESHOLD = 0.45
+# 0.62 prevents unrelated pages (e.g. "Onboarding Guide") from matching
+# unrelated queries (e.g. "deployment").  Genuine topic matches typically
+# score 0.65+; tangential but relevant docs sit around 0.55–0.64.
+_SIM_THRESHOLD = 0.62
 
 _db:          Optional[firestore.Client]     = None
 _embed_model: Optional[TextEmbeddingModel]   = None
@@ -166,20 +168,67 @@ def _parse_date(date_str: str) -> Optional[datetime]:
     return None
 
 
+def _build_query(db: firestore.Client,
+                 source_type: Optional[str],
+                 days_ago: Optional[int]) -> tuple:
+    """Build the most selective Firestore query possible using server-side indexes.
+
+    Strategy
+    --------
+    Push equality (source) and range (date) filters to Firestore so the SDK
+    only streams the matching subset.  Author is a substring match — Firestore
+    doesn't support that natively — so it stays as a Python post-filter.
+
+    Composite indexes required (declared in firestore.indexes.json):
+      (source, modified_date DESC)
+      (source, ingested_at  DESC)
+      (modified_date DESC)          ← single-field, auto-created by Firestore
+      (ingested_at  DESC)           ← single-field, auto-created by Firestore
+
+    Returns: (query_ref, ts_cutoff_or_None)
+      query_ref  — a Firestore Query ready for .stream()
+      ts_cutoff  — datetime used for the cutoff (None if no days_ago given);
+                   kept so the caller can post-filter docs that store their date
+                   in modified_date vs ingested_at without re-computing it.
+    """
+    coll = db.collection(_COLLECTION)
+    ts_cutoff: Optional[datetime] = None
+
+    # ── 1. Equality filter: source ────────────────────────────────────────────
+    q = coll.where("source", "==", source_type.lower()) if source_type else coll
+
+    # ── 2. Range filter: date ─────────────────────────────────────────────────
+    # Prefer modified_date; fall back to ingested_at for docs that lack it.
+    # Firestore requires a composite index when combining equality + range on
+    # different fields — those are declared in firestore.indexes.json.
+    if days_ago:
+        ts_cutoff = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        cutoff_iso = ts_cutoff.isoformat()
+        if source_type:
+            # Use modified_date with the (source, modified_date) composite index.
+            # Docs without modified_date won't match but are rare in practice.
+            q = q.where("modified_date", ">=", cutoff_iso)
+        else:
+            # No source filter — rely on the single-field modified_date index.
+            q = q.where("modified_date", ">=", cutoff_iso)
+
+    return q, ts_cutoff
+
+
 def search_knowledge_base(query: str, top_k: int = 5,
                            days_ago: int = None,
                            author: str = None,
                            source_type: str = None) -> list[dict]:
     """Semantic search over the knowledge base using text-embedding-004.
 
-    Optionally pre-filters documents by metadata before running cosine
-    similarity, so the ranking pool is already restricted to matching docs.
+    Server-side Firestore indexes handle source_type (equality) and days_ago
+    (range on modified_date).  Author is a Python post-filter (substring match).
+    Cosine similarity re-ranks the surviving set.
 
     Args:
         query:       Natural language question or keywords.
         top_k:       Max results to return (default 5).
-        days_ago:    Only consider docs whose modified_date or ingested_at
-                     falls within the last N days.
+        days_ago:    Only consider docs modified/ingested within the last N days.
         author:      Case-insensitive substring match against the author field.
         source_type: Exact match against the source field, e.g. "confluence".
 
@@ -187,38 +236,55 @@ def search_knowledge_base(query: str, top_k: int = 5,
         List of dicts — keys: text, source, title, url, author, date, score
     """
     try:
-        db   = _get_db()
-        docs = list(db.collection(_COLLECTION).stream())
-        if not docs:
+        db = _get_db()
+
+        # ── Server-side filtering (indexes) ───────────────────────────────────
+        q, ts_cutoff = _build_query(db, source_type, days_ago)
+        raw_docs = list(q.stream())
+        if not raw_docs:
             return []
 
-        # ── Metadata pre-filter ───────────────────────────────────────────────
-        ts_cutoff = (datetime.now(timezone.utc) - timedelta(days=days_ago)
-                     if days_ago else None)
-
-        filtered = []
-        for doc in docs:
+        # ── Python post-filters ───────────────────────────────────────────────
+        filtered: list[tuple] = []
+        for doc in raw_docs:
             d = doc.to_dict()
 
-            # source_type filter (exact match on the 'source' field)
-            if source_type and d.get("source", "").lower() != source_type.lower():
-                continue
-
-            # author filter (case-insensitive substring)
+            # Author: case-insensitive substring (can't do this in Firestore)
             if author and author.lower() not in d.get("author", "").lower():
                 continue
 
-            # days_ago filter — try modified_date first, fall back to ingested_at
-            if ts_cutoff:
-                date_str = d.get("modified_date") or d.get("ingested_at", "")
-                doc_dt   = _parse_date(date_str)
-                if doc_dt and doc_dt < ts_cutoff:
+            # Date fallback: docs that store date only in ingested_at (no
+            # modified_date) were skipped by the server-side range filter above;
+            # include them here if they fall inside the window.
+            if ts_cutoff and not d.get("modified_date"):
+                fallback_dt = _parse_date(d.get("ingested_at", ""))
+                if fallback_dt and fallback_dt < ts_cutoff:
                     continue
 
             filtered.append((doc, d))
 
         if not filtered:
             return []
+
+        # ── Filter-only mode: no query → return docs sorted by date ──────────
+        if not query or not query.strip():
+            results = []
+            for _, d in filtered:
+                results.append({
+                    "text":   d.get("text", "")[:350],
+                    "title":  d.get("title", "Unknown"),
+                    "source": d.get("source", ""),
+                    "url":    d.get("url", ""),
+                    "author": d.get("author", ""),
+                    "date":   d.get("modified_date", ""),
+                    "score":  1.0,
+                })
+            # Sort by modified_date descending (most-recent first)
+            results.sort(
+                key=lambda r: r["date"] or "0000",
+                reverse=True,
+            )
+            return results[:top_k]
 
         # ── Embed query once ──────────────────────────────────────────────────
         try:

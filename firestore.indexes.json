@@ -1,0 +1,55 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",        "order": "ASCENDING" },
+        { "fieldPath": "modified_date", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",        "order": "ASCENDING" },
+        { "fieldPath": "ingested_at",   "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "author",        "order": "ASCENDING" },
+        { "fieldPath": "modified_date", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "author",        "order": "ASCENDING" },
+        { "fieldPath": "ingested_at",   "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",        "order": "ASCENDING" },
+        { "fieldPath": "author",        "order": "ASCENDING" },
+        { "fieldPath": "modified_date", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "knowledge_base",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "source",        "order": "ASCENDING" },
+        { "fieldPath": "author",        "order": "ASCENDING" },
+        { "fieldPath": "ingested_at",   "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

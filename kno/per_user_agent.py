@@ -112,7 +112,13 @@ Help employees find information from their connected tools quickly and accuratel
 
 ## Search strategy
 - Always search before saying you don't know.
-- For documents/knowledge base: use search_knowledge_base first.
+- For documents/knowledge base:
+  * User asks about a TOPIC ("find docs about onboarding", "deployment guide") → call search_knowledge_base(query="...")
+  * User asks by DATE only ("updated last 30 days", "recent docs", "this month") → call browse_knowledge_base(days_ago=30) ← NO keyword needed, call immediately
+  * User asks by AUTHOR only ("docs by Dhanapal", "written by Alice") → call browse_knowledge_base(author="Dhanapal") ← NO keyword needed, call immediately
+  * User asks by SOURCE only ("all Confluence pages") → call browse_knowledge_base(source_type="confluence") ← call immediately
+  * Combined date+author or date+source → call browse_knowledge_base(days_ago=30, author="Alice")
+  RULE: NEVER ask the user for a keyword when they specify a date, author, or source filter. Call browse_knowledge_base immediately.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
 - For files: use search_drive.
 - For team chat:
@@ -147,8 +153,9 @@ Every search tool accepts optional filter parameters. Apply them proactively:
 Rules:
 - ALWAYS add days_ago when user says "recent", "latest", "last N days/weeks/months".
 - ALWAYS add author when user names a person in context of finding content.
-- For search_knowledge_base only: add source_type to limit to one source ("confluence", "github", etc.).
+- For KB only: add source_type to limit to one source ("confluence", "github", "drive", etc.).
 - Do NOT invent filters the user didn't imply.
+- KB filter-only queries → use browse_knowledge_base (not search_knowledge_base). NEVER ask for a keyword when the user gives a date, author, or source.
 
 ## Memory
 - Use load_memory when user references past conversations ("last week", "that deal").
@@ -934,48 +941,81 @@ def _make_zoho_tools(email: str):
 
 # ── Agent runner ──────────────────────────────────────────────────────────────
 
-def _make_rag_tool():
-    """Wrap the RAG knowledge base search as an ADK-compatible tool."""
+def _make_rag_tools() -> list:
+    """Return two knowledge-base tools:
+      - search_knowledge_base  → topic/semantic search (requires a query keyword)
+      - browse_knowledge_base  → filter-only browsing by date/author/source (no keyword needed)
+    """
     try:
         from kno.rag_connector import search_knowledge_base as _rag_search
 
-        def search_knowledge_base(query: str, days_ago: int = None,
-                                   author: str = None,
-                                   source_type: str = None) -> dict:
-            """Search the company knowledge base for information using semantic similarity.
-
-            Use this FIRST for any question about company processes, policies, how-tos,
-            product specs, or internal documentation. Returns passages with source citations.
-
-            Args:
-                query: Natural language search query, e.g. 'onboarding process for engineers'
-                days_ago: Only return docs modified/ingested within the last N days
-                author: Filter by document author/contributor name
-                source_type: Limit to one source — 'confluence', 'github', 'drive', etc.
-            """
-            results = _rag_search(query, top_k=5,
-                                  days_ago=days_ago, author=author, source_type=source_type)
+        def _format(results: list, label: str) -> dict:
             if not results:
-                return {"status": "no_results", "message": f"No knowledge base articles found for: {query}"}
+                return {"status": "no_results",
+                        "message": f"No knowledge base articles found for: {label}"}
             return {
                 "status": "success",
                 "count": len(results),
                 "passages": [
                     {
-                        "title": r["title"],
+                        "title":   r["title"],
                         "excerpt": r["text"][:400],
-                        "url": r["url"],
-                        "author": r["author"],
-                        "date": r["date"],
-                        "source": r["source"],
+                        "url":     r["url"],
+                        "author":  r["author"],
+                        "date":    r["date"],
+                        "source":  r["source"],
                     }
                     for r in results
                 ],
             }
 
-        return search_knowledge_base
+        def search_knowledge_base(query: str,
+                                   days_ago: int = None,
+                                   author: str = None,
+                                   source_type: str = None) -> dict:
+            """Search the company knowledge base by TOPIC using semantic similarity.
+
+            Use when the user names a specific subject, e.g. "onboarding", "deployment guide",
+            "API rate limits". Returns the most relevant passages with source citations.
+
+            Args:
+                query:       Required topic or question, e.g. 'how do we onboard engineers'
+                days_ago:    Also restrict to docs modified within the last N days
+                author:      Also restrict to docs by this author
+                source_type: Also restrict to one source ('confluence', 'github', etc.)
+            """
+            results = _rag_search(query, top_k=5,
+                                  days_ago=days_ago, author=author,
+                                  source_type=source_type)
+            return _format(results, query)
+
+        def browse_knowledge_base(days_ago: int = None,
+                                   author: str = None,
+                                   source_type: str = None) -> dict:
+            """Browse the knowledge base by date, author, or source — NO keyword needed.
+
+            Call this immediately (without asking for a keyword) whenever the user asks:
+              - "show recent docs" / "updated last 30 days" / "this month"
+              - "docs written by Alice" / "pages by Dhanapal"
+              - "all Confluence pages"
+              - any combination of the above
+
+            Results are sorted newest-first.
+
+            Args:
+                days_ago:    Return docs modified/ingested within the last N days (e.g. 30, 90)
+                author:      Filter by author name — case-insensitive substring match
+                source_type: Filter by source — 'confluence', 'github', 'drive', etc.
+            """
+            results = _rag_search("", top_k=10,
+                                  days_ago=days_ago, author=author,
+                                  source_type=source_type)
+            label = f"filters: days_ago={days_ago}, author={author}, source_type={source_type}"
+            return _format(results, label)
+
+        return [search_knowledge_base, browse_knowledge_base]
     except Exception:
-        return None
+        return []
 
 
 def _build_tools(email: str) -> list:
@@ -984,10 +1024,8 @@ def _build_tools(email: str) -> list:
         PreloadMemoryTool(),
         LoadMemoryTool(),
     ]
-    # RAG knowledge base (Confluence + Drive semantic search)
-    rag_tool = _make_rag_tool()
-    if rag_tool:
-        tools.append(rag_tool)
+    # RAG knowledge base — two tools: search (topic) + browse (filter-only)
+    tools += _make_rag_tools()
 
     tools.append(_make_gmail_tool(email))
     tools.append(_make_drive_tool(email))
