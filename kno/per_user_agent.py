@@ -22,6 +22,9 @@ from googleapiclient.discovery import build
 
 from kno.user_store import get_app_credentials
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 # ── Shared date helper ────────────────────────────────────────────────────────
 
@@ -120,7 +123,7 @@ Help employees find information from their connected tools quickly and accuratel
   * Combined date+author or date+source → call browse_knowledge_base(days_ago=30, author="Alice")
   RULE: NEVER ask the user for a keyword when they specify a date, author, or source filter. Call browse_knowledge_base immediately.
 - For emails: use search_gmail. Show subject, sender, date — NOT full body.
-- For files: use search_drive.
+- For files: use search_drive. When a result contains a PDF, image, PowerPoint, or scanned doc, call read_drive_file_multimodal(file_id, file_name, mime_type) to extract full content before answering. Always mention the file type in the citation: "[1] Google Drive (PDF): Annual Report 2025".
 - For team chat:
   * "What's been discussed in Slack?" → call get_slack_activity()  ← no parameters, call immediately
   * "What's happening in Slack?" → call get_slack_activity()
@@ -241,21 +244,64 @@ def _make_gmail_tool(email: str):
     return search_gmail
 
 
-def _make_drive_tool(email: str):
+def _make_drive_tools(email: str) -> list:
+    """Return two Drive tools: search_drive and read_drive_file_multimodal."""
     creds_data = get_app_credentials(email, "gmail")  # Gmail and Drive share OAuth
+
+    # ── MIME type helpers ─────────────────────────────────────────────────────
+    _GOOGLE_EXPORT = {
+        "application/vnd.google-apps.document":     ("text/plain",              "txt"),
+        "application/vnd.google-apps.spreadsheet":  ("text/csv",                "csv"),
+        "application/vnd.google-apps.presentation": ("application/pdf",         "pdf"),
+        "application/vnd.google-apps.drawing":      ("image/png",               "png"),
+    }
+    _MULTIMODAL_MIME = {
+        "application/pdf",
+        "image/jpeg", "image/jpg", "image/png", "image/gif",
+        "image/webp", "image/heic", "image/heif",
+    }
+    _LABEL = {
+        "application/pdf":                           "PDF",
+        "application/vnd.google-apps.spreadsheet":  "Sheet",
+        "application/vnd.google-apps.presentation": "Slides",
+        "application/vnd.google-apps.document":     "Doc",
+        "image/jpeg": "Image", "image/jpg": "Image",
+        "image/png":  "Image", "image/gif": "Image",
+    }
+
+    def _type_label(mime: str) -> str:
+        for k, v in _LABEL.items():
+            if k in mime:
+                return v
+        return "File"
+
+    def _is_multimodal_candidate(mime: str) -> bool:
+        """True for file types Gemini can read natively via inline_data."""
+        if mime in _MULTIMODAL_MIME:
+            return True
+        if "google-apps.presentation" in mime or "google-apps.spreadsheet" in mime:
+            return True   # will be exported to PDF/CSV first
+        return False
+
+    # ── Tool 1: search_drive ──────────────────────────────────────────────────
 
     def search_drive(query: str, max_results: int = 5,
                      days_ago: int = None, author: str = None) -> dict:
         """Search Google Drive for files matching a query.
 
+        Returns a list of matching files with metadata. For PDFs, images,
+        Slides, and Sheets the result includes a mime_type field — pass
+        that to read_drive_file_multimodal to extract full content.
+
         Args:
-            query: Keyword search, e.g. 'Q3 roadmap deck'
+            query:       Keyword search, e.g. 'Q3 roadmap deck'
             max_results: Max files to return (default 5)
-            days_ago: Only return files modified in the last N days
-            author: Filter by owner display name, e.g. 'Alice Smith'
+            days_ago:    Only return files modified in the last N days
+            author:      Filter by owner display name, e.g. 'Alice Smith'
         """
         if not creds_data:
-            return {"status": "error", "message": "Google Drive not connected — go to Settings to connect your Google account."}
+            return {"status": "error",
+                    "message": "Google Drive not connected — go to Settings to connect your Google account."}
         try:
             svc = build("drive", "v3", credentials=_google_creds(creds_data))
             drive_q = f"fullText contains '{query}' and trashed=false"
@@ -273,36 +319,36 @@ def _make_drive_tool(email: str):
 
             results = []
             for f in files:
-                file_entry = {
-                    "id": f["id"],
-                    "name": f.get("name"),
-                    "modified": f.get("modifiedTime"),
-                    "url": f.get("webViewLink"),
-                    "owner": (f.get("owners") or [{}])[0].get("displayName", ""),
-                    "snippet": "",
-                }
-                # Try to export a plain-text snippet for Docs/Sheets/Slides
                 mime = f.get("mimeType", "")
-                if "google-apps.document" in mime or "google-apps.presentation" in mime or "google-apps.spreadsheet" in mime:
+                file_entry = {
+                    "id":        f["id"],
+                    "name":      f.get("name"),
+                    "mime_type": mime,
+                    "type":      _type_label(mime),
+                    "modified":  f.get("modifiedTime"),
+                    "url":       f.get("webViewLink"),
+                    "owner":     (f.get("owners") or [{}])[0].get("displayName", ""),
+                    "snippet":   "",
+                    "multimodal_available": _is_multimodal_candidate(mime),
+                }
+                # Quick plain-text snippet for Google Docs only
+                if "google-apps.document" in mime:
                     try:
-                        export_resp = svc.files().export(
+                        raw = svc.files().export(
                             fileId=f["id"], mimeType="text/plain"
                         ).execute()
-                        if isinstance(export_resp, bytes):
-                            text = export_resp.decode("utf-8", errors="replace")
-                        else:
-                            text = str(export_resp)
+                        text = (raw if isinstance(raw, str) else
+                                raw.decode("utf-8", errors="replace"))
                         import re as _re
-                        text = _re.sub(r"\s+", " ", text).strip()
-                        file_entry["snippet"] = text[:400]
+                        file_entry["snippet"] = _re.sub(r"\s+", " ", text).strip()[:400]
                     except Exception:
                         pass
                 results.append(file_entry)
 
-            # Post-filter by author/owner display name
+            # Post-filter by author/owner
             if author:
-                author_l = author.lower()
-                results = [f for f in results if author_l in f.get("owner", "").lower()]
+                al = author.lower()
+                results = [r for r in results if al in r.get("owner", "").lower()]
 
             if not results:
                 return {"status": "no_results", "message": f"No files found for: {query}"}
@@ -310,7 +356,104 @@ def _make_drive_tool(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return search_drive
+    # ── Tool 2: read_drive_file_multimodal ────────────────────────────────────
+
+    def read_drive_file_multimodal(file_id: str, file_name: str,
+                                    mime_type: str) -> dict:
+        """Read a Drive file using Gemini multimodal — works for PDFs, images,
+        PowerPoint/Slides, spreadsheets, and scanned documents.
+
+        Call this after search_drive returns a file with multimodal_available=true.
+        Gemini reads the full binary content — every page of a PDF, every slide,
+        every cell in a sheet — and returns extracted text and a summary.
+
+        Args:
+            file_id:   The Drive file ID from search_drive results
+            file_name: The file name (used for the citation)
+            mime_type: The MIME type from search_drive results, e.g. 'application/pdf'
+        """
+        if not creds_data:
+            return {"status": "error",
+                    "message": "Google Drive not connected."}
+        try:
+            import io
+            import vertexai
+            from vertexai.generative_models import GenerativeModel, Part
+
+            svc = build("drive", "v3", credentials=_google_creds(creds_data))
+
+            # ── Step 1: get raw bytes ─────────────────────────────────────────
+            export_mime, actual_mime = None, mime_type
+
+            if mime_type in _GOOGLE_EXPORT:
+                export_mime, _ = _GOOGLE_EXPORT[mime_type]
+                actual_mime    = export_mime
+                req = svc.files().export_media(fileId=file_id, mimeType=export_mime)
+            else:
+                req = svc.files().get_media(fileId=file_id)
+
+            buf = io.BytesIO()
+            from googleapiclient.http import MediaIoBaseDownload
+            dl = MediaIoBaseDownload(buf, req)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            raw_bytes = buf.getvalue()
+
+            # ── Step 2: plain-text fast path for CSV exports ──────────────────
+            if actual_mime == "text/csv":
+                text = raw_bytes.decode("utf-8", errors="replace")
+                return {
+                    "status":    "success",
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "type":      _type_label(mime_type),
+                    "content":   text[:6000],
+                    "summary":   text[:1000],
+                }
+
+            # ── Step 3: plain-text fast path for exported Docs ───────────────
+            if actual_mime == "text/plain":
+                text = raw_bytes.decode("utf-8", errors="replace")
+                import re as _re
+                text = _re.sub(r"\s+", " ", text).strip()
+                return {
+                    "status":    "success",
+                    "file_name": file_name,
+                    "mime_type": mime_type,
+                    "type":      _type_label(mime_type),
+                    "content":   text[:6000],
+                    "summary":   text[:1000],
+                }
+
+            # ── Step 4: Gemini multimodal for PDF / images ────────────────────
+            vertexai.init(project=_GCP_PROJECT, location=_GCP_LOCATION)
+            model = GenerativeModel("gemini-2.5-flash-preview-04-17")
+
+            file_part = Part.from_data(data=raw_bytes, mime_type=actual_mime)
+            response  = model.generate_content([
+                file_part,
+                "Extract all text content from this file. "
+                "Return the full text, preserving headings and structure. "
+                "If it contains data tables, include the key figures. "
+                "Be thorough — do not summarise, extract everything.",
+            ])
+            extracted = response.text.strip()
+
+            return {
+                "status":    "success",
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "type":      _type_label(mime_type),
+                "content":   extracted[:8000],
+                "summary":   extracted[:1000],
+            }
+
+        except Exception as e:
+            logger.error("read_drive_file_multimodal failed for %s: %s", file_name, e)
+            return {"status": "error", "message": str(e)}
+
+    return [search_drive, read_drive_file_multimodal]
 
 
 def _make_slack_tools(email: str):
@@ -1028,7 +1171,7 @@ def _build_tools(email: str) -> list:
     tools += _make_rag_tools()
 
     tools.append(_make_gmail_tool(email))
-    tools.append(_make_drive_tool(email))
+    tools += _make_drive_tools(email)
     tools += _make_slack_tools(email)
     tools += _make_github_tools(email)
     tools += _make_jira_tools(email)
