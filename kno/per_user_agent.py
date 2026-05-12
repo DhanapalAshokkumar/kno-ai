@@ -428,7 +428,7 @@ def _make_drive_tools(email: str) -> list:
 
             # ── Step 4: Gemini multimodal for PDF / images ────────────────────
             vertexai.init(project=_GCP_PROJECT, location=_GCP_LOCATION)
-            model = GenerativeModel("gemini-2.5-flash-preview-04-17")
+            model = GenerativeModel("gemini-2.5-flash")
 
             file_part = Part.from_data(data=raw_bytes, mime_type=actual_mime)
             response  = model.generate_content([
