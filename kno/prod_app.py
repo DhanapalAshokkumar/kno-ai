@@ -438,6 +438,115 @@ def kb_backfill(email: str = Depends(current_user)):
     return backfill_embeddings()
 
 
+# ── Agent Generation Engine ──────────────────────────────────────────────────
+
+class CreateAgentRequest(BaseModel):
+    description: str           # plain-English description of the agent
+    org_id: Optional[str] = "" # optional org for multi-tenant isolation
+
+
+class RunAgentRequest(BaseModel):
+    pass   # no body needed — user identity comes from auth
+
+
+@app.post("/agents/create")
+async def create_agent(body: CreateAgentRequest,
+                       email: str = Depends(current_user)):
+    """Parse a natural-language description and generate a deployable agent.
+
+    Body: {"description": "Every Monday at 9am, find open Zoho deals with no
+           activity in 7 days and create a Jira follow-up task for each one"}
+
+    Returns the generated AgentDefinition with validation results.
+    The agent is saved as 'active' if validation passes, 'draft' otherwise.
+    """
+    from kno.agent_builder import (
+        parse_agent_intent, generate_agent_definition,
+        validate_agent, deploy_agent,
+    )
+
+    if not body.description.strip():
+        raise HTTPException(status_code=400, detail="description cannot be empty")
+
+    try:
+        intent     = parse_agent_intent(body.description)
+        definition = generate_agent_definition(intent, created_by=email,
+                                               org_id=body.org_id or "")
+        validation = validate_agent(definition, email)
+
+        if validation["valid"]:
+            result = deploy_agent(definition)
+            return {
+                "status":     "deployed",
+                "agent":      definition,
+                "validation": validation,
+                "schedule":   result,
+            }
+        else:
+            # Save as draft so user can fix missing connections
+            from google.cloud import firestore as _fs
+            _fs.Client(project=os.environ.get("GOOGLE_CLOUD_PROJECT","kno-ai-494516")) \
+               .collection("agents").document(definition["id"]).set(definition)
+            return {
+                "status":     "draft",
+                "agent":      definition,
+                "validation": validation,
+                "message":    "Agent saved as draft. Fix the errors below, then call POST /agents/{id}/run to activate.",
+            }
+
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent creation failed: {e}")
+
+
+@app.get("/agents")
+def list_agents_endpoint(email: str = Depends(current_user)):
+    """List all agents created by the current user."""
+    from kno.agent_builder import list_agents
+    agents = list_agents(email)
+    return {"status": "success", "count": len(agents), "agents": agents}
+
+
+@app.post("/agents/{agent_id}/run")
+async def run_agent(agent_id: str, email: str = Depends(current_user)):
+    """Manually trigger an agent by ID.
+
+    Runs all steps in sequence and returns the execution log.
+    """
+    from kno.agent_builder import get_agent
+    from kno.agent_runner  import execute_agent
+
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found")
+    if agent.get("created_by") != email:
+        raise HTTPException(status_code=403, detail="Not your agent")
+    if agent.get("status") == "error":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Agent is in error state: {agent.get('last_error')}. Fix the issue and retry."
+        )
+
+    result = execute_agent(agent_id, user_email=email, triggered_by="manual")
+    return result
+
+
+@app.get("/agents/{agent_id}/history")
+def agent_history(agent_id: str, email: str = Depends(current_user)):
+    """Return execution history for an agent (last 20 runs)."""
+    from kno.agent_builder import get_agent
+    from kno.agent_runner  import get_execution_history
+
+    agent = get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.get("created_by") != email:
+        raise HTTPException(status_code=403, detail="Not your agent")
+
+    return {"agent_id": agent_id, "history": get_execution_history(agent_id)}
+
+
 # ── Chat ──────────────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
