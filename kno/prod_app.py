@@ -58,7 +58,7 @@ GOOGLE_SCOPES = " ".join([
     "openid",
     "email",
     "profile",
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",   # read + send (superset of readonly)
     "https://www.googleapis.com/auth/drive.readonly",
 ])
 
@@ -175,8 +175,8 @@ def auth_slack(request: Request, email: str = Depends(current_user)):
     params = {
         "client_id": SLACK_CLIENT_ID,
         "redirect_uri": SLACK_REDIRECT_URI,
-        "scope": "channels:read,channels:history,groups:read,groups:history",
-        "user_scope": "search:read,channels:read,channels:history,groups:read,groups:history",
+        "scope": "channels:read,channels:history,groups:read,groups:history,chat:write",
+        "user_scope": "search:read,channels:read,channels:history,groups:read,groups:history,chat:write",
         "state": state,
     }
     url = "https://slack.com/oauth/v2/authorize?" + urllib.parse.urlencode(params)

@@ -88,7 +88,7 @@ def _make_services():
 _session_service, _memory_service = _make_services()
 
 SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",   # read + send + labels (superset of readonly)
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
@@ -995,8 +995,23 @@ def _make_jira_tools(email: str):
             return {"status": "error", "message": "Jira not connected — go to Settings."}
         try:
             proj = project or creds_data.get("jira_project", "")
+
+            # If no project given or the given one is invalid, auto-discover
+            def _list_projects():
+                pr = req.get(_base("/rest/api/3/project/search"), auth=_auth(),
+                             params={"maxResults": 50})
+                if pr.ok:
+                    return [p["key"] for p in pr.json().get("values", [])]
+                return []
+
             if not proj:
-                return {"status": "error", "message": "No Jira project specified. Pass project='KEY' or set it in Settings."}
+                available = _list_projects()
+                if len(available) == 1:
+                    proj = available[0]   # auto-pick if there's exactly one
+                else:
+                    return {"status": "error",
+                            "message": f"No Jira project specified. Available projects: {available}. "
+                                        "Pass project='KEY' with one of those keys."}
 
             fields: dict = {
                 "project":   {"key": proj},
@@ -1016,6 +1031,13 @@ def _make_jira_tools(email: str):
 
             r = req.post(_base("/rest/api/3/issue"), auth=_auth(), json={"fields": fields})
             if not r.ok:
+                # If project key invalid, return available projects to help the user
+                if r.status_code in (400, 404):
+                    available = _list_projects()
+                    return {"status": "error",
+                            "message": f"Project '{proj}' not found. "
+                                        f"Available projects: {available}. "
+                                        "Retry with the correct project key."}
                 return {"status": "error", "message": r.text[:300]}
 
             data = r.json()
@@ -1067,15 +1089,21 @@ def _make_jira_tools(email: str):
             if status:
                 trans_r = req.get(_base(f"/rest/api/3/issue/{issue_key}/transitions"), auth=_auth())
                 transitions = trans_r.json().get("transitions", []) if trans_r.ok else []
+                # Exact match first, then fuzzy (contains)
                 match = next((t for t in transitions
                               if t["name"].lower() == status.lower()), None)
+                if not match:
+                    match = next((t for t in transitions
+                                  if status.lower() in t["name"].lower()
+                                  or t["name"].lower() in status.lower()), None)
                 if match:
                     tr = req.post(_base(f"/rest/api/3/issue/{issue_key}/transitions"),
                                   auth=_auth(), json={"transition": {"id": match["id"]}})
-                    results.append({"transition": tr.status_code, "to": status})
+                    results.append({"transition": tr.status_code, "to": match["name"]})
                 else:
                     available = [t["name"] for t in transitions]
-                    results.append({"transition_error": f"Status '{status}' not found. Available: {available}"})
+                    results.append({"transition_error": f"Status '{status}' not found. "
+                                    f"Available transitions: {available}. Use one of these exact names."})
 
             # Add comment
             if comment:
@@ -1190,10 +1218,11 @@ def _make_zoho_tools(email: str):
             return {"status": "error", "message": str(e)}
 
     def search_zoho_deals(stage: str = None, days_ago: int = None,
-                          owner: str = None) -> dict:
-        """List Zoho CRM deals, optionally filtered by pipeline stage, recency, or owner.
+                          owner: str = None, name: str = None) -> dict:
+        """List Zoho CRM deals, optionally filtered by name, stage, recency, or owner.
 
         Args:
+            name:  Search by deal name (substring, case-insensitive), e.g. 'Acme'
             stage: Deal stage to filter by, e.g. 'Qualification', 'Closed Won'.
                    Pass None to return all deals.
             days_ago: Only return deals modified in the last N days
@@ -1203,7 +1232,11 @@ def _make_zoho_tools(email: str):
             return {"status": "error", "message": "Zoho CRM not connected — go to Settings to connect Zoho."}
         try:
             fields = "Deal_Name,Amount,Stage,Closing_Date,Modified_Time,Owner"
-            if stage:
+            if name:
+                # Zoho word_match search: searches across all text fields
+                resp = _get(f"{BASE}/Deals/search",
+                            params={"word": name, "fields": fields})
+            elif stage:
                 resp = _get(f"{BASE}/Deals/search",
                             params={"criteria": f"Stage:equals:{stage}", "fields": fields})
             else:
