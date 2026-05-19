@@ -1355,12 +1355,12 @@ def _make_zoho_tools(email: str):
     def create_zoho_activity(deal_id: str, subject: str,
                               activity_type: str = "Call",
                               description: str = "", due_date: str = None) -> dict:
-        """Log a follow-up activity (call, email, meeting) against a Zoho deal.
+        """Log a follow-up activity (call, task, or meeting) against a Zoho deal.
 
         Args:
             deal_id:       Zoho deal record ID to attach the activity to
             subject:       Activity subject/title
-            activity_type: 'Call', 'Email', or 'Meeting' (default: Call)
+            activity_type: 'Call', 'Task', or 'Meeting' (default: Call)
             description:   Notes about the activity
             due_date:      Due date in YYYY-MM-DD format (defaults to today)
         """
@@ -1368,18 +1368,51 @@ def _make_zoho_tools(email: str):
             return {"status": "error", "message": "Zoho CRM not connected — go to Settings."}
         try:
             from datetime import date
-            payload = {
-                "Subject":  subject,
-                "Activity_Type": activity_type,
-                "Description":   description,
-                "Due_Date": due_date or date.today().isoformat(),
-                "What_Id": {"id": deal_id, "type": "Deals"},
-            }
-            r = _post(f"{BASE}/Activities", {"data": [payload]})
+            today = due_date or date.today().isoformat()
+
+            # Zoho /Activities is read-only — must POST to the module-specific endpoint.
+            # Calls → /Calls, Meetings → /Events, everything else → /Tasks
+            atype = activity_type.lower()
+            if atype == "call":
+                module  = "Calls"
+                # Call_Start_Time is required; use due_date at 10:00 local
+                payload = {
+                    "Subject":          subject,
+                    "Call_Type":        "Outbound",
+                    "Call_Duration":    "0:05",
+                    "Call_Start_Time":  f"{today}T10:00:00+05:30",
+                    "Description":      description,
+                    "$se_module":       "Deals",
+                    "What_Id":          {"id": deal_id},
+                }
+            elif atype in ("meeting", "event"):
+                module  = "Events"
+                payload = {
+                    "Event_Title":   subject,
+                    "Start_DateTime": f"{today}T10:00:00+05:30",
+                    "End_DateTime":   f"{today}T11:00:00+05:30",
+                    "Description":    description,
+                    "$se_module":     "Deals",
+                    "What_Id":        {"id": deal_id},
+                }
+            else:
+                # Default: Task (also handles 'email', 'follow-up', etc.)
+                module  = "Tasks"
+                payload = {
+                    "Subject":    subject,
+                    "Due_Date":   today,
+                    "Status":     "Not Started",
+                    "Priority":   "Normal",
+                    "Description": description,
+                    "$se_module": "Deals",
+                    "What_Id":    {"id": deal_id},
+                }
+
+            r = _post(f"{BASE}/{module}", {"data": [payload]})
             if not r.ok:
                 return {"status": "error", "message": r.text[:300]}
 
-            resp_data = r.json().get("data", [{}])[0]
+            resp_data   = r.json().get("data", [{}])[0]
             activity_id = resp_data.get("details", {}).get("id", "")
             return {
                 "status":      "created",
@@ -1387,6 +1420,7 @@ def _make_zoho_tools(email: str):
                 "deal_id":     deal_id,
                 "subject":     subject,
                 "type":        activity_type,
+                "module":      module,
             }
         except Exception as e:
             return {"status": "error", "message": str(e)}
