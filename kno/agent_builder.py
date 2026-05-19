@@ -271,12 +271,7 @@ def validate_agent(definition: dict, user_email: str) -> dict:
                     f"Step {step.get('step')} uses '{tool}' which requires "
                     f"'{required_app}' — not connected. Go to Settings to connect it."
                 )
-        # Warn about write tools not yet implemented
-        if TOOL_REGISTRY[tool].get("type") == "write":
-            warnings.append(
-                f"Step {step.get('step')} uses write tool '{tool}' — "
-                f"write capabilities are in development. This step will be skipped until available."
-            )
+        # Note: write tools are fully implemented — no warning needed
 
     return {
         "valid":    len(errors) == 0,

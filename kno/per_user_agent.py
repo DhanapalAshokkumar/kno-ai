@@ -130,9 +130,19 @@ Help employees find information from their connected tools quickly and accuratel
   * "Summarise #general" → call get_slack_activity()
   * "Search Slack for budget" → call search_slack_messages(query="budget")
   RULE: For any open-ended Slack question, call get_slack_activity() immediately — zero parameters, no clarifying question needed.
-- For tasks/bugs: use search_jira_issues.
+- For tasks/bugs: use search_jira_issues. To CREATE a ticket: create_jira_issue(summary, project, issue_type, description). To UPDATE: update_jira_issue(issue_key, status/comment/assignee).
 - For code/PRs: use list_github_repos, search_github_issues, or get_github_pull_requests.
-- For CRM: use search_zoho_contacts or search_zoho_deals.
+- For CRM: use search_zoho_contacts or search_zoho_deals. To UPDATE a deal: update_zoho_deal(deal_id, stage/amount/closing_date). To LOG activity: create_zoho_activity(deal_id, subject, activity_type).
+
+## Write / action tools — use when the user asks you to DO something
+- "Send an email to Alice about X" → send_gmail(to, subject, body)
+- "Post to #general that X" → post_slack_message(channel, text)
+- "Create a Jira ticket for X" → create_jira_issue(summary, project, issue_type, description)
+- "Move ENG-42 to Done" → update_jira_issue(issue_key="ENG-42", status="Done")
+- "Add a comment to ENG-42" → update_jira_issue(issue_key="ENG-42", comment="...")
+- "Update the Acme deal stage to Closed Won" → update_zoho_deal(deal_id, stage="Closed Won")
+- "Log a follow-up call on the TechCo deal" → create_zoho_activity(deal_id, subject, activity_type="Call")
+RULE: Always confirm the action with the user BEFORE calling a write tool, unless they explicitly said "do it" or "go ahead". Show what you're about to do: "I'll create a Jira ticket: [summary] in project ENG — shall I proceed?"
 
 ## Formatting
 - Be concise. Use bullet points. Employees are busy.
@@ -241,7 +251,49 @@ def _make_gmail_tool(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return search_gmail
+    def send_gmail(to: str, subject: str, body: str,
+                   cc: str = None, reply_to_thread_id: str = None) -> dict:
+        """Send an email via Gmail.
+
+        Args:
+            to:                 Recipient email address, e.g. 'alice@company.com'
+            subject:            Email subject line
+            body:               Plain-text email body
+            cc:                 Optional CC email address
+            reply_to_thread_id: Optional Gmail thread ID to reply into
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Gmail not connected — go to Settings."}
+        try:
+            import email.mime.text
+            import email.mime.multipart
+
+            svc = build("gmail", "v1", credentials=_google_creds(creds_data))
+
+            msg = email.mime.multipart.MIMEMultipart()
+            msg["To"]      = to
+            msg["Subject"] = subject
+            if cc:
+                msg["Cc"] = cc
+            msg.attach(email.mime.text.MIMEText(body, "plain"))
+
+            raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
+            payload: dict = {"raw": raw}
+            if reply_to_thread_id:
+                payload["threadId"] = reply_to_thread_id
+
+            sent = svc.users().messages().send(userId="me", body=payload).execute()
+            return {
+                "status":    "sent",
+                "message_id": sent.get("id"),
+                "thread_id":  sent.get("threadId"),
+                "to":         to,
+                "subject":    subject,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_gmail, send_gmail]
 
 
 def _make_drive_tools(email: str) -> list:
@@ -571,7 +623,37 @@ def _make_slack_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [get_slack_activity, search_slack_messages]
+    def post_slack_message(channel: str, text: str,
+                            thread_ts: str = None) -> dict:
+        """Post a message to a Slack channel or thread.
+
+        Args:
+            channel:   Channel name (e.g. 'general') or ID (e.g. 'C012AB3CD')
+            text:      Message text — supports Slack mrkdwn formatting
+            thread_ts: Optional timestamp of parent message to reply in-thread
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Slack not connected — go to Settings."}
+        try:
+            cli = WebClient(token=creds_data.get("user_token") or creds_data.get("bot_token", ""))
+            # Normalise channel name — strip leading # if present
+            ch = channel.lstrip("#")
+            kwargs: dict = {"channel": ch, "text": text}
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            resp = cli.chat_postMessage(**kwargs)
+            return {
+                "status":     "sent",
+                "channel":    resp.get("channel"),
+                "ts":         resp.get("ts"),
+                "message":    text[:100],
+            }
+        except SlackApiError as e:
+            return {"status": "error", "message": str(e)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [get_slack_activity, search_slack_messages, post_slack_message]
 
 
 def _make_github_tools(email: str):
@@ -894,7 +976,129 @@ def _make_jira_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [search_jira_issues, get_jira_issue, search_confluence_pages, get_confluence_page]
+    def create_jira_issue(summary: str, project: str = None,
+                          issue_type: str = "Task", description: str = "",
+                          assignee: str = None, priority: str = None,
+                          labels: list = None) -> dict:
+        """Create a new Jira issue.
+
+        Args:
+            summary:    Issue title/summary (required)
+            project:    Jira project key, e.g. 'ENG'. Defaults to user's saved project.
+            issue_type: 'Task', 'Bug', 'Story', 'Epic' (default: Task)
+            description: Issue description in plain text
+            assignee:   Jira account ID or display name to assign to
+            priority:   'Highest', 'High', 'Medium', 'Low', 'Lowest'
+            labels:     List of label strings, e.g. ['follow-up', 'crm']
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Jira not connected — go to Settings."}
+        try:
+            proj = project or creds_data.get("jira_project", "")
+            if not proj:
+                return {"status": "error", "message": "No Jira project specified. Pass project='KEY' or set it in Settings."}
+
+            fields: dict = {
+                "project":   {"key": proj},
+                "summary":   summary,
+                "issuetype": {"name": issue_type},
+            }
+            if description:
+                fields["description"] = {
+                    "type":    "doc",
+                    "version": 1,
+                    "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}],
+                }
+            if priority:
+                fields["priority"] = {"name": priority}
+            if labels:
+                fields["labels"] = labels
+
+            r = req.post(_base("/rest/api/3/issue"), auth=_auth(), json={"fields": fields})
+            if not r.ok:
+                return {"status": "error", "message": r.text[:300]}
+
+            data = r.json()
+            issue_key = data.get("key", "")
+            return {
+                "status":    "created",
+                "key":       issue_key,
+                "id":        data.get("id"),
+                "url":       f"https://{creds_data['site']}/browse/{issue_key}",
+                "summary":   summary,
+                "project":   proj,
+                "issue_type": issue_type,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def update_jira_issue(issue_key: str, summary: str = None,
+                          status: str = None, assignee: str = None,
+                          comment: str = None, priority: str = None) -> dict:
+        """Update an existing Jira issue — change status, add a comment, reassign, etc.
+
+        Args:
+            issue_key: Jira issue key, e.g. 'ENG-42'
+            summary:   New summary/title (optional)
+            status:    Transition to this status, e.g. 'In Progress', 'Done'
+            assignee:  Jira account ID to assign to
+            comment:   Add a comment to the issue
+            priority:  New priority: 'Highest', 'High', 'Medium', 'Low'
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Jira not connected."}
+        try:
+            results = []
+
+            # Update fields (summary, assignee, priority)
+            update_fields: dict = {}
+            if summary:
+                update_fields["summary"] = summary
+            if priority:
+                update_fields["priority"] = {"name": priority}
+            if assignee:
+                update_fields["assignee"] = {"id": assignee}
+            if update_fields:
+                r = req.put(_base(f"/rest/api/3/issue/{issue_key}"),
+                            auth=_auth(), json={"fields": update_fields})
+                results.append({"field_update": r.status_code})
+
+            # Status transition
+            if status:
+                trans_r = req.get(_base(f"/rest/api/3/issue/{issue_key}/transitions"), auth=_auth())
+                transitions = trans_r.json().get("transitions", []) if trans_r.ok else []
+                match = next((t for t in transitions
+                              if t["name"].lower() == status.lower()), None)
+                if match:
+                    tr = req.post(_base(f"/rest/api/3/issue/{issue_key}/transitions"),
+                                  auth=_auth(), json={"transition": {"id": match["id"]}})
+                    results.append({"transition": tr.status_code, "to": status})
+                else:
+                    available = [t["name"] for t in transitions]
+                    results.append({"transition_error": f"Status '{status}' not found. Available: {available}"})
+
+            # Add comment
+            if comment:
+                cr = req.post(_base(f"/rest/api/3/issue/{issue_key}/comment"),
+                              auth=_auth(), json={
+                                  "body": {
+                                      "type": "doc", "version": 1,
+                                      "content": [{"type": "paragraph", "content": [{"type": "text", "text": comment}]}],
+                                  }
+                              })
+                results.append({"comment": cr.status_code})
+
+            return {
+                "status":    "updated",
+                "key":       issue_key,
+                "url":       f"https://{creds_data['site']}/browse/{issue_key}",
+                "actions":   results,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_jira_issues, get_jira_issue, search_confluence_pages,
+            get_confluence_page, create_jira_issue, update_jira_issue]
 
 
 def _make_zoho_tools(email: str):
@@ -1061,7 +1265,101 @@ def _make_zoho_tools(email: str):
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
-    return [search_zoho_contacts, search_zoho_deals, get_zoho_contact]
+    def _post(url, data):
+        resp = req.post(url, headers=_headers(), json=data)
+        if resp.status_code == 401:
+            _refresh()
+            resp = req.post(url, headers=_headers(), json=data)
+        return resp
+
+    def _put(url, data):
+        resp = req.put(url, headers=_headers(), json=data)
+        if resp.status_code == 401:
+            _refresh()
+            resp = req.put(url, headers=_headers(), json=data)
+        return resp
+
+    def update_zoho_deal(deal_id: str, stage: str = None,
+                         amount: float = None, closing_date: str = None,
+                         description: str = None) -> dict:
+        """Update fields on an existing Zoho CRM deal.
+
+        Args:
+            deal_id:      Zoho deal record ID (from search_zoho_deals results)
+            stage:        New pipeline stage, e.g. 'Proposal/Price Quote', 'Closed Won'
+            amount:       Updated deal amount as a number, e.g. 95000
+            closing_date: New closing date in YYYY-MM-DD format
+            description:  Notes to add to the deal description
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Zoho CRM not connected — go to Settings."}
+        try:
+            update: dict = {"id": deal_id}
+            if stage:
+                update["Stage"] = stage
+            if amount is not None:
+                update["Amount"] = amount
+            if closing_date:
+                update["Closing_Date"] = closing_date
+            if description:
+                update["Description"] = description
+
+            r = _put(f"{BASE}/Deals", {"data": [update]})
+            if not r.ok:
+                return {"status": "error", "message": r.text[:300]}
+
+            resp_data = r.json().get("data", [{}])[0]
+            return {
+                "status":  "updated",
+                "deal_id": deal_id,
+                "url":     _deal_url(deal_id),
+                "code":    resp_data.get("code"),
+                "message": resp_data.get("message", ""),
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def create_zoho_activity(deal_id: str, subject: str,
+                              activity_type: str = "Call",
+                              description: str = "", due_date: str = None) -> dict:
+        """Log a follow-up activity (call, email, meeting) against a Zoho deal.
+
+        Args:
+            deal_id:       Zoho deal record ID to attach the activity to
+            subject:       Activity subject/title
+            activity_type: 'Call', 'Email', or 'Meeting' (default: Call)
+            description:   Notes about the activity
+            due_date:      Due date in YYYY-MM-DD format (defaults to today)
+        """
+        if not creds_data:
+            return {"status": "error", "message": "Zoho CRM not connected — go to Settings."}
+        try:
+            from datetime import date
+            payload = {
+                "Subject":  subject,
+                "Activity_Type": activity_type,
+                "Description":   description,
+                "Due_Date": due_date or date.today().isoformat(),
+                "What_Id": {"id": deal_id, "type": "Deals"},
+            }
+            r = _post(f"{BASE}/Activities", {"data": [payload]})
+            if not r.ok:
+                return {"status": "error", "message": r.text[:300]}
+
+            resp_data = r.json().get("data", [{}])[0]
+            activity_id = resp_data.get("details", {}).get("id", "")
+            return {
+                "status":      "created",
+                "activity_id": activity_id,
+                "deal_id":     deal_id,
+                "subject":     subject,
+                "type":        activity_type,
+            }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    return [search_zoho_contacts, search_zoho_deals, get_zoho_contact,
+            update_zoho_deal, create_zoho_activity]
 
 
 # ── Agent runner ──────────────────────────────────────────────────────────────
@@ -1152,12 +1450,12 @@ def _build_tools(email: str) -> list:
     # RAG knowledge base — two tools: search (topic) + browse (filter-only)
     tools += _make_rag_tools()
 
-    tools.append(_make_gmail_tool(email))
-    tools += _make_drive_tools(email)
-    tools += _make_slack_tools(email)
-    tools += _make_github_tools(email)
-    tools += _make_jira_tools(email)
-    tools += _make_zoho_tools(email)
+    tools += _make_gmail_tool(email)     # [search_gmail, send_gmail]
+    tools += _make_drive_tools(email)    # [search_drive, read_drive_file_multimodal]
+    tools += _make_slack_tools(email)    # [get_slack_activity, search_slack_messages, post_slack_message]
+    tools += _make_github_tools(email)   # [list_github_repos, search_github_issues, get_github_pull_requests]
+    tools += _make_jira_tools(email)     # [search_jira_issues, get_jira_issue, search_confluence_pages, get_confluence_page, create_jira_issue, update_jira_issue]
+    tools += _make_zoho_tools(email)     # [search_zoho_contacts, search_zoho_deals, get_zoho_contact, update_zoho_deal, create_zoho_activity]
     return tools
 
 

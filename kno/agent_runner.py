@@ -105,21 +105,25 @@ def _call_tool(tool_name: str, parameters: dict, user_email: str) -> Any:
             logger.warning("_call_tool: dropped unknown params for %s: %s", tool_name, dropped)
         return tool_fn(**safe_params)
 
-    # ── Write tools — implemented stubs (to be wired in Week 1) ─────────────
-    write_stubs = {
-        "create_jira_issue", "update_jira_issue",
-        "send_gmail",
-        "post_slack_message",
-        "update_zoho_deal", "create_zoho_activity",
+    # ── Write tools — live implementations ───────────────────────────────────
+    write_dispatch = {
+        "send_gmail":           lambda: _make_gmail_tool(user_email)[1],
+        "post_slack_message":   lambda: _make_slack_tools(user_email)[2],
+        "create_jira_issue":    lambda: _make_jira_tools(user_email)[4],
+        "update_jira_issue":    lambda: _make_jira_tools(user_email)[5],
+        "update_zoho_deal":     lambda: _make_zoho_tools(user_email)[3],
+        "create_zoho_activity": lambda: _make_zoho_tools(user_email)[4],
     }
-    if tool_name in write_stubs:
-        logger.info("[STUB] %s called with params: %s", tool_name, parameters)
-        return {
-            "status":  "stub",
-            "tool":    tool_name,
-            "message": f"Write tool '{tool_name}' logged (implementation coming in Week 1)",
-            "params":  parameters,
-        }
+    if tool_name in write_dispatch:
+        tool_fn     = write_dispatch[tool_name]()
+        import inspect
+        sig         = inspect.signature(tool_fn)
+        valid_keys  = set(sig.parameters.keys())
+        safe_params = {k: v for k, v in parameters.items() if k in valid_keys}
+        if len(safe_params) < len(parameters):
+            logger.warning("_call_tool write: dropped unknown params for %s: %s",
+                           tool_name, set(parameters) - valid_keys)
+        return tool_fn(**safe_params)
 
     return {"status": "error", "message": f"Unknown tool: {tool_name}"}
 
@@ -137,6 +141,8 @@ def _resolve_params(params: dict, step_outputs: dict) -> dict:
     resolved = {}
     for key, val in params.items():
         if isinstance(val, str):
+            # Normalise step_N → stepN before resolving references
+            val = re.sub(r"step_(\d+)", r"step\1", val)
             # Replace {stepN.field.subfield} style references
             def replacer(m):
                 path = m.group(1).split(".")
@@ -236,25 +242,29 @@ def execute_agent(agent_id: str, user_email: str,
 
         # for_each: iterate over a list from a previous step output
         if for_each:
-            # e.g. for_each = "step1.files"
-            path = for_each.split(".")
+            # Normalise: Gemini writes "step_1.deals", runner stores "step1"
+            normalised = re.sub(r"step_(\d+)", r"step\1", for_each)
+            path  = normalised.split(".")
             items = step_outputs
             for part in path:
                 items = items.get(part, []) if isinstance(items, dict) else []
             if not isinstance(items, list):
                 items = [items] if items else []
 
+            logger.info("  Step %d for_each '%s' → %d items", step_num, for_each, len(items))
+
             iteration_results = []
             for item in items:
                 iter_params = {k: v for k, v in params.items()}
-                # Inject the current item as {item.field} references
+                # Inject current item fields as {item.field} AND {step_N.current_item.field}
                 if isinstance(item, dict):
                     for k, v in item.items():
                         for param_key in iter_params:
                             if isinstance(iter_params[param_key], str):
-                                iter_params[param_key] = iter_params[param_key].replace(
-                                    f"{{item.{k}}}", str(v)
-                                )
+                                iter_params[param_key] = iter_params[param_key] \
+                                    .replace(f"{{item.{k}}}", str(v)) \
+                                    .replace(f"{{step_{step_num - 1}.current_item.{k}}}", str(v)) \
+                                    .replace(f"{{step{step_num - 1}.current_item.{k}}}", str(v))
                 try:
                     result = _call_tool(tool_name, iter_params, user_email)
                     iteration_results.append(result)
