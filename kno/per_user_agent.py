@@ -1355,12 +1355,15 @@ def _make_zoho_tools(email: str):
     def create_zoho_activity(deal_id: str, subject: str,
                               activity_type: str = "Call",
                               description: str = "", due_date: str = None) -> dict:
-        """Log a follow-up activity (call, task, or meeting) against a Zoho deal.
+        """Log a follow-up activity (call, task, or meeting) as a Note on a Zoho deal.
+
+        Creates a CRM Note linked to the deal — works with standard CRM OAuth scopes.
+        The note captures the activity type, subject, date, and any description.
 
         Args:
             deal_id:       Zoho deal record ID to attach the activity to
             subject:       Activity subject/title
-            activity_type: 'Call', 'Task', or 'Meeting' (default: Call)
+            activity_type: 'Call', 'Task', 'Meeting', or 'Email' (default: Call)
             description:   Notes about the activity
             due_date:      Due date in YYYY-MM-DD format (defaults to today)
         """
@@ -1370,57 +1373,39 @@ def _make_zoho_tools(email: str):
             from datetime import date
             today = due_date or date.today().isoformat()
 
-            # Zoho /Activities is read-only — must POST to the module-specific endpoint.
-            # Calls → /Calls, Meetings → /Events, everything else → /Tasks
-            atype = activity_type.lower()
-            if atype == "call":
-                module  = "Calls"
-                # Call_Start_Time is required; use due_date at 10:00 local
-                payload = {
-                    "Subject":          subject,
-                    "Call_Type":        "Outbound",
-                    "Call_Duration":    "0:05",
-                    "Call_Start_Time":  f"{today}T10:00:00+05:30",
-                    "Description":      description,
-                    "$se_module":       "Deals",
-                    "What_Id":          {"id": deal_id},
-                }
-            elif atype in ("meeting", "event"):
-                module  = "Events"
-                payload = {
-                    "Event_Title":   subject,
-                    "Start_DateTime": f"{today}T10:00:00+05:30",
-                    "End_DateTime":   f"{today}T11:00:00+05:30",
-                    "Description":    description,
-                    "$se_module":     "Deals",
-                    "What_Id":        {"id": deal_id},
-                }
-            else:
-                # Default: Task (also handles 'email', 'follow-up', etc.)
-                module  = "Tasks"
-                payload = {
-                    "Subject":    subject,
-                    "Due_Date":   today,
-                    "Status":     "Not Started",
-                    "Priority":   "Normal",
-                    "Description": description,
-                    "$se_module": "Deals",
-                    "What_Id":    {"id": deal_id},
-                }
+            # Zoho's /Calls, /Tasks, /Events require additional OAuth scopes
+            # (ZohoCRM.modules.calls.ALL, etc.) that may not be on the user's token.
+            # /Notes is covered by standard deal/contact scopes and serves the same
+            # purpose as a logged activity — visible on the deal timeline.
+            note_content = f"[{activity_type.upper()}] {subject}"
+            if description:
+                note_content += f"\n\n{description}"
+            note_content += f"\n\nDue: {today}"
 
-            r = _post(f"{BASE}/{module}", {"data": [payload]})
+            payload = {
+                "Note_Title":   subject,
+                "Note_Content": note_content,
+                "Parent_Id":    {"id": deal_id},
+                "$se_module":   "Deals",
+            }
+
+            r = _post(f"{BASE}/Notes", {"data": [payload]})
             if not r.ok:
-                return {"status": "error", "message": r.text[:300]}
+                return {
+                    "status":  "error",
+                    "message": f"Zoho Notes API {r.status_code}: {r.text[:300]}",
+                }
 
             resp_data   = r.json().get("data", [{}])[0]
-            activity_id = resp_data.get("details", {}).get("id", "")
+            note_id     = resp_data.get("details", {}).get("id", "")
             return {
                 "status":      "created",
-                "activity_id": activity_id,
+                "activity_id": note_id,
                 "deal_id":     deal_id,
                 "subject":     subject,
                 "type":        activity_type,
-                "module":      module,
+                "module":      "Notes",
+                "url":         _deal_url(deal_id),
             }
         except Exception as e:
             return {"status": "error", "message": str(e)}
