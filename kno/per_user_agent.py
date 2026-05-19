@@ -1532,9 +1532,8 @@ async def run_user_query(email: str, message: str, session_id: str = None) -> st
         tools=tools,
     )
 
-    # VertexAiSessionService requires app_name = reasoning engine ID.
-    # InMemorySessionService accepts any string.
-    app_name = _AGENT_ENGINE_ID if (_USE_VERTEX and _AGENT_ENGINE_ID) else "kno"
+    # ADK App.name must start with a letter — prefix numeric engine IDs.
+    app_name = f"kno-{_AGENT_ENGINE_ID}" if (_USE_VERTEX and _AGENT_ENGINE_ID) else "kno"
 
     runner = Runner(
         agent=agent,
