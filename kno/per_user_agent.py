@@ -63,21 +63,12 @@ _AGENT_ENGINE_ID = os.environ.get("AGENT_ENGINE_ID", "")
 # Build session + memory services once at module load
 # (Cloud Run keeps the module warm between requests)
 def _make_services():
-    # ADK App.name validation requires the name to start with a letter, but
-    # VertexAiSessionService._get_reasoning_engine_id() requires the raw numeric
-    # engine ID as app_name — these two constraints are incompatible.
-    # Use InMemorySessionService for session management (works fine per Cloud Run
-    # instance) and only use VertexAiMemoryBankService for cross-session recall.
-    session_svc = InMemorySessionService()
-    if _USE_VERTEX and _AGENT_ENGINE_ID:
-        memory_svc = VertexAiMemoryBankService(
-            project=_GCP_PROJECT,
-            location=_GCP_LOCATION,
-            agent_engine_id=_AGENT_ENGINE_ID,
-        )
-    else:
-        memory_svc = InMemoryMemoryService()
-    return session_svc, memory_svc
+    # Use in-memory services only. VertexAiSessionService conflicts with ADK
+    # App.name validation (numeric engine IDs fail the letter-start requirement),
+    # and VertexAiMemoryBankService with PreloadMemoryTool causes silent empty
+    # responses when the memory bank call fails or returns before the agent turn.
+    # Re-enable Vertex services once the ADK resolves the app_name constraint.
+    return InMemorySessionService(), InMemoryMemoryService()
 
 _session_service, _memory_service = _make_services()
 
