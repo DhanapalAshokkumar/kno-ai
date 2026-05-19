@@ -94,7 +94,16 @@ def _call_tool(tool_name: str, parameters: dict, user_email: str) -> Any:
     }
     if tool_name in read_dispatch:
         tool_fn = read_dispatch[tool_name]()
-        return tool_fn(**parameters)
+        # Filter parameters to only those the tool function actually accepts,
+        # preventing errors when Gemini invents parameter names that don't exist.
+        import inspect
+        sig        = inspect.signature(tool_fn)
+        valid_keys = set(sig.parameters.keys())
+        safe_params = {k: v for k, v in parameters.items() if k in valid_keys}
+        if len(safe_params) < len(parameters):
+            dropped = set(parameters) - valid_keys
+            logger.warning("_call_tool: dropped unknown params for %s: %s", tool_name, dropped)
+        return tool_fn(**safe_params)
 
     # ── Write tools — implemented stubs (to be wired in Week 1) ─────────────
     write_stubs = {
